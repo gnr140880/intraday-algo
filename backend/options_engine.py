@@ -21,6 +21,8 @@ import numpy as np
 from kite_client import KiteClient
 from config import settings
 from strategies.nifty_options_orb import NiftyOptionsORBStrategy
+from strategies.vwap_mean_reversion import VWAPMeanReversionStrategy
+from strategies.expiry_premium_sell import ExpiryPremiumSellStrategy
 from scoring_engine import ScoringEngine, OptionCandidate
 from risk_manager import RiskManager, TradeRecord
 from telegram_alerts import telegram
@@ -29,11 +31,39 @@ from market_data_fallback import (
     fetch_nifty_history_yf,
     build_option_candidates_from_instruments,
 )
+from level_calculator import LevelCalculator, IntraDayLevels
+from smart_sl_engine import SmartSLEngine, SmartLevels, compute_smart_levels
+from exit_signal_generator import (
+    ExitSignalGenerator, ExitSignal, PositionContext, ExitPriority, ExitReason,
+)
+from auto_order_manager import AutoOrderManager, ManagedPosition
+from trade_journal import trade_journal
+from trailing_sl_manager import TrailingSLManager, TrailingConfig, trailing_sl_manager
+from live_oi_feed import LiveOIFeed
 
 logger = logging.getLogger(__name__)
 
-# Constants
-NIFTY_LOT_SIZE = 65
+# Instrument configuration (multi-instrument support)
+INSTRUMENT_CONFIG = {
+    "NIFTY": {
+        "name": "NIFTY",
+        "spot_symbol": "NSE:NIFTY 50",
+        "nfo_name": "NIFTY",
+        "lot_size_setting": "nifty_lot_size",
+        "strike_gap": 50,
+        "default_lot_size": 75,
+    },
+    "BANKNIFTY": {
+        "name": "BANKNIFTY",
+        "spot_symbol": "NSE:NIFTY BANK",
+        "nfo_name": "BANKNIFTY",
+        "lot_size_setting": "banknifty_lot_size",
+        "strike_gap": 100,
+        "default_lot_size": 30,
+    },
+}
+
+# Legacy constants (kept for backward compat)
 NIFTY_STRIKE_GAP = 50
 NIFTY_INSTRUMENT = "NSE:NIFTY 50"
 
@@ -45,14 +75,63 @@ class NiftyOptionsEngine:
 
     def __init__(self):
         self.strategy = NiftyOptionsORBStrategy()
+        self.vwap_strategy = VWAPMeanReversionStrategy()
+        self.expiry_strategy = ExpiryPremiumSellStrategy()
         self.scorer = ScoringEngine()
         self.risk_mgr = RiskManager(
             capital=settings.default_capital,
-            daily_loss_limit_pct=2.0,
-            max_risk_per_trade_pct=1.0,
-            max_concurrent_positions=5,
-            square_off_time=time(15, 15),
+            daily_loss_limit_pct=settings.daily_loss_limit_pct,
+            max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
+            max_concurrent_positions=settings.max_concurrent_positions,
+            square_off_time=time(*[int(x) for x in settings.square_off_time.split(":")]),
         )
+        self.level_calc = LevelCalculator()
+        self.sl_engine = SmartSLEngine()
+        self.exit_gen = ExitSignalGenerator(square_off_time=time(15, 15))
+        self.order_mgr = AutoOrderManager(self.risk_mgr)
+        self.order_mgr.load_state()  # Restore positions after restart
+        # Re-register restored positions with risk manager
+        for tid, pos in self.order_mgr.positions.items():
+            if pos.status != "CLOSED":
+                from risk_manager import TradeRecord
+                tr = TradeRecord(
+                    trade_id=pos.trade_id,
+                    symbol=pos.symbol,
+                    option_type=pos.option_type,
+                    entry_price=pos.entry_price,
+                    entry_time=pos.created_at,
+                    quantity=pos.quantity,
+                    sl=pos.trailing_sl,
+                    target=pos.smart_levels.option_t1 if pos.smart_levels else 0,
+                    trailing_sl=pos.trailing_sl,
+                    score=pos.score,
+                )
+                self.risk_mgr.register_trade(tr)
+        self.journal = trade_journal
+        self.tsl_mgr = TrailingSLManager(TrailingConfig(
+            breakeven_trigger_pct=settings.tsl_breakeven_trigger_pct,
+            early_breakeven_pct=settings.tsl_early_breakeven_pct,
+            trail_t1_atr_mult=settings.tsl_trail_t1_atr_mult,
+            trail_t2_atr_mult=settings.tsl_trail_t2_atr_mult,
+            tight_atr_mult=settings.tsl_tight_atr_mult,
+            tight_trigger_pct=settings.tsl_tight_trigger_pct,
+            trail_pct_initial=settings.tsl_trail_pct_initial,
+            trail_pct_t2=settings.tsl_trail_pct_t2,
+            trail_pct_tight=settings.tsl_trail_pct_tight,
+            swing_lookback_candles=settings.tsl_swing_lookback,
+            sl_buffer_pct=settings.tsl_sl_buffer_pct,
+        ))
+
+        # Auto-trading mode: 'off' (signals only), 'paper', 'live'
+        self.auto_trade_mode = settings.trading_mode  # 'paper' or 'live'
+
+        # WebSocket tick state
+        self._tick_data: Dict[int, Dict] = {}  # token → latest tick data
+        self._ws_connected = False
+
+        # Live OI Feed (WebSocket-based)
+        self._oi_feed: Optional[LiveOIFeed] = None
+        self._oi_feed_started = False
 
         # State
         self.orb_high: Optional[float] = None
@@ -65,6 +144,24 @@ class NiftyOptionsEngine:
         self._orb_captured = False
         self._today: Optional[date] = None
         self._cycle_count = 0
+        self._alerted_signal_key: Optional[str] = None   # "BUY@24700" — skip re-alerting same signal
+        self._alerted_strikes: set = set()                # strikes already sent via Telegram
+        self._traded_strikes: set = set()                 # strikes already attempted for execution
+        self._cached_levels: Optional[IntraDayLevels] = None
+        self._cached_df: Optional[pd.DataFrame] = None
+        self._cached_oi_data: Dict = {}  # OI analysis: ce/pe change %, per-strike OI
+
+        # Safety filters state
+        self._india_vix: float = 0.0           # Current India VIX reading
+        self._last_sl_hit: Dict[str, datetime] = {}  # direction → last SL-hit time for cooldown
+
+        # Gap-day classification state
+        self._gap_type: str = "NONE"           # GAP_UP, LARGE_GAP_UP, GAP_DOWN, LARGE_GAP_DOWN, NONE
+        self._gap_pct: float = 0.0             # gap magnitude in %
+
+        # Multi-timeframe state
+        self._st_dir_15m: int = 0              # supertrend direction on 15m
+        self._st_dir_1h: int = 0               # supertrend direction on 1h
 
         # Dashboard state (live)
         self.dashboard_state: Dict = {
@@ -74,6 +171,11 @@ class NiftyOptionsEngine:
             "top_candidates": [],
             "risk": {},
             "trades": [],
+            "levels": {},
+            "auto_trade_mode": self.auto_trade_mode,
+            "active_positions": [],
+            "order_log": [],
+            "oi_analysis": {"ce_oi_change_pct": 0, "pe_oi_change_pct": 0},
             "last_update": None,
         }
 
@@ -93,8 +195,184 @@ class NiftyOptionsEngine:
         self.all_candidates = []
         self._cycle_count = 0
         self.risk_mgr.reset_daily()
+        self.journal.reset_daily()
+        self._last_sl_hit = {}  # Reset cooldown on new day
+        self._alerted_signal_key = None
+        self._alerted_strikes = set()
+        self._traded_strikes = set()
+        self._gap_type = "NONE"
+        self._gap_pct = 0.0
+        self._st_dir_15m = 0
+        self._st_dir_1h = 0
         self.dashboard_state["engine_status"] = "WAITING_ORB"
+        # Stop previous day's OI feed if running
+        if self._oi_feed and self._oi_feed.is_running:
+            self._oi_feed.stop()
+            self._oi_feed_started = False
         logger.info(f"NiftyOptionsEngine initialised for {today}")
+
+    # ------------------------------------------------------------------
+    # Start / manage Live OI Feed
+    # ------------------------------------------------------------------
+    def _start_oi_feed(self, kite: KiteClient):
+        """
+        Start the live OI feed via Kite WebSocket.
+        Subscribes to NIFTY weekly options around ATM in MODE_FULL.
+        Safe to call multiple times — will only start once.
+        """
+        if not settings.enable_live_oi_feed:
+            return
+        if self._oi_feed_started and self._oi_feed and self._oi_feed.is_running:
+            # Update ATM if spot moved
+            if self.nifty_spot > 0:
+                self._oi_feed.update_atm(self.nifty_spot)
+            return
+        if not kite.is_connected:
+            return
+        if self.nifty_spot <= 0:
+            return
+
+        try:
+            nifty_token = self._resolve_nifty_token(kite)
+            inst_cfg = INSTRUMENT_CONFIG.get("NIFTY", INSTRUMENT_CONFIG["NIFTY"])
+
+            self._oi_feed = LiveOIFeed(
+                kite_client=kite,
+                strike_gap=inst_cfg["strike_gap"],
+                num_strikes=settings.oi_feed_num_strikes,
+            )
+            self._oi_feed.start(
+                spot_price=self.nifty_spot,
+                nifty_spot_token=nifty_token,
+            )
+            self._oi_feed_started = True
+            logger.info("Live OI feed started successfully")
+        except Exception as e:
+            logger.warning(f"Failed to start live OI feed: {e}")
+            self._oi_feed_started = False
+
+    def _get_live_oi_data(self) -> Optional[Dict]:
+        """
+        Get live OI analysis from WebSocket feed.
+        Returns None if feed is not running.
+        """
+        if (
+            self._oi_feed
+            and self._oi_feed.is_running
+        ):
+            try:
+                return self._oi_feed.get_oi_analysis()
+            except Exception as e:
+                logger.debug(f"Live OI data fetch failed: {e}")
+        return None
+
+    def _update_candidates_from_live_oi(self):
+        """
+        Update scored candidates with live OI, volume, LTP from WebSocket feed.
+        This is more reliable than Kite get_ltp since data comes from MODE_FULL ticks.
+        """
+        if not self._oi_feed or not self._oi_feed.is_running:
+            return
+        if not self.scored_candidates:
+            return
+
+        updated = 0
+        for c in self.scored_candidates:
+            live = self._oi_feed.get_candidate_live_data(c.tradingsymbol)
+            if live and live["ltp"] > 0:
+                c.ltp = live["ltp"]
+                c.volume = live["volume"]
+                c.oi = live["oi"]
+                c.oi_change_pct = live["oi_change_pct"]
+                c.bid = live["bid"] if live["bid"] > 0 else round(live["ltp"] * 0.995, 2)
+                c.ask = live["ask"] if live["ask"] > 0 else round(live["ltp"] * 1.005, 2)
+                c.price_source = "live"
+                c.oi_interpretation = live["buildup"]
+                updated += 1
+
+        if updated > 0:
+            # Re-score with live data
+            for c in self.scored_candidates:
+                self.scorer.score_candidate(c, levels=self._cached_levels)
+            logger.info(f"Updated {updated} candidates from live OI feed")
+
+    # ------------------------------------------------------------------
+    # Refresh option LTPs for all candidates using Kite get_ltp
+    # ------------------------------------------------------------------
+    def _refresh_candidate_ltps(self, kite: KiteClient):
+        """
+        Refresh LTP (and recalculate entry/SL/targets) for all scored candidates
+        using Kite get_ltp. This ensures dashboard shows current market prices.
+        Also updates spot_price so SL/target mapping reflects current NIFTY level.
+        """
+        if not self.scored_candidates:
+            return
+        symbols = [f"NFO:{c.tradingsymbol}" for c in self.scored_candidates]
+        try:
+            ltp_data = kite.get_ltp(symbols[:20])  # batch limit
+            updated = 0
+            for c in self.scored_candidates:
+                key = f"NFO:{c.tradingsymbol}"
+                ltp = ltp_data.get(key, {}).get("last_price", 0)
+                if ltp > 0 and ltp != c.ltp:
+                    c.ltp = ltp
+                    c.bid = round(ltp * 0.995, 2)
+                    c.ask = round(ltp * 1.005, 2)
+                    c.price_source = "live"
+                    updated += 1
+            # Also refresh NIFTY spot so SL/target mapping is current
+            if self.nifty_spot > 0:
+                for c in self.scored_candidates:
+                    c.spot_price = self.nifty_spot
+            if updated > 0:
+                # Re-score with updated LTPs to recalculate entry/SL/targets
+                for c in self.scored_candidates:
+                    self.scorer.score_candidate(c, levels=self._cached_levels)
+                logger.info(f"Refreshed LTP for {updated} scored candidates")
+        except Exception as e:
+            # Mark as stale if refresh failed — user knows prices may be outdated
+            for c in self.scored_candidates:
+                if c.price_source != "live":
+                    c.price_source = "estimated"
+            logger.debug(f"LTP refresh for candidates failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Fetch India VIX for safety filter
+    # ------------------------------------------------------------------
+    def _fetch_india_vix(self, kite: KiteClient) -> float:
+        """Fetch current India VIX. Returns 0 on failure (trades proceed)."""
+        try:
+            vix_data = kite.get_ltp(["NSE:INDIA VIX"])
+            vix = vix_data.get("NSE:INDIA VIX", {}).get("last_price", 0.0)
+            if vix and vix > 0:
+                self._india_vix = float(vix)
+                return self._india_vix
+        except Exception as e:
+            logger.debug(f"VIX fetch failed: {e}")
+        return self._india_vix  # return cached value if fetch fails
+
+    # ------------------------------------------------------------------
+    # Re-entry cooldown check
+    # ------------------------------------------------------------------
+    def _check_reentry_cooldown(self, direction: str) -> bool:
+        """Returns True if cooldown is active (should NOT trade)."""
+        last_hit = self._last_sl_hit.get(direction)
+        if last_hit is None:
+            return False
+        elapsed = (datetime.now() - last_hit).total_seconds() / 60.0
+        cooldown = settings.reentry_cooldown_minutes
+        if elapsed < cooldown:
+            logger.info(
+                f"Re-entry cooldown active for {direction}: "
+                f"{elapsed:.0f}/{cooldown} min since last SL hit"
+            )
+            return True
+        return False
+
+    def record_sl_hit(self, direction: str):
+        """Record SL hit time for re-entry cooldown."""
+        self._last_sl_hit[direction] = datetime.now()
+        logger.info(f"SL hit recorded for {direction} – cooldown started")
 
     # ------------------------------------------------------------------
     # Resolve NIFTY instrument token
@@ -163,6 +441,245 @@ class NiftyOptionsEngine:
             return round(norm.cdf(d1) - 1, 4)
 
     # ------------------------------------------------------------------
+    # OI Analysis — fetch previous day OI + compute change %
+    # ------------------------------------------------------------------
+    def _fetch_oi_analysis(
+        self,
+        kite: KiteClient,
+        weekly_opts: List[Dict],
+        atm_strike: float,
+        spot: float,
+        nearest_expiry,
+        strike_gap: int = 50,
+    ) -> Dict:
+        """
+        Fetch OI data for option chain strikes and compute:
+          - Per-strike OI change % vs previous close
+          - Aggregate CE/PE OI change % for ATM ± 3 strikes
+        Returns: {
+          "strike_oi": {(strike, type): {"oi": int, "prev_oi": int, "oi_change_pct": float}},
+          "ce_oi_change_pct": float,   # aggregate CE OI change near ATM
+          "pe_oi_change_pct": float,   # aggregate PE OI change near ATM
+        }
+        """
+        result = {
+            "strike_oi": {},
+            "ce_oi_change_pct": 0.0,
+            "pe_oi_change_pct": 0.0,
+        }
+
+        # ATM ± 3 strikes for aggregate CE/PE OI analysis
+        oi_strikes = range(
+            int(atm_strike - 3 * strike_gap),
+            int(atm_strike + 4 * strike_gap),
+            strike_gap,
+        )
+        oi_instruments = [
+            i for i in weekly_opts
+            if i["strike"] in oi_strikes and i["instrument_type"] in ("CE", "PE")
+        ]
+
+        if not oi_instruments:
+            return result
+
+        # 1. Fetch current OI via quotes for both CE and PE near ATM
+        oi_symbols = [f"NFO:{i['tradingsymbol']}" for i in oi_instruments[:40]]
+        try:
+            oi_quotes = kite.get_quote(oi_symbols)
+        except Exception as e:
+            logger.warning(f"OI quote fetch failed: {e}")
+            return result
+
+        # 2. Fetch previous day closing OI via historical data (day candle with oi=True)
+        prev_oi_map = {}  # instrument_token → prev day OI
+        yesterday = date.today() - timedelta(days=1)
+        # Go back up to 5 days to find last trading day
+        from_dt = datetime.combine(date.today() - timedelta(days=5), time(0, 0))
+        to_dt = datetime.combine(date.today() - timedelta(days=1), time(23, 59))
+
+        for inst in oi_instruments:
+            token = inst["instrument_token"]
+            if token in prev_oi_map:
+                continue
+            try:
+                hist = kite.get_historical_data(
+                    token, from_dt, to_dt, "day", oi=True
+                )
+                if hist:
+                    # Last day's OI
+                    last_bar = hist[-1]
+                    prev_oi_map[token] = last_bar.get("oi", 0)
+            except Exception:
+                pass  # Some instruments may not have history
+
+        # 3. Compute per-strike OI change and aggregate CE/PE OI changes
+        total_ce_oi = 0
+        total_ce_prev_oi = 0
+        total_pe_oi = 0
+        total_pe_prev_oi = 0
+
+        for inst in oi_instruments:
+            key = f"NFO:{inst['tradingsymbol']}"
+            q = oi_quotes.get(key, {})
+            curr_oi = q.get("oi", 0)
+            token = inst["instrument_token"]
+            prev_oi = prev_oi_map.get(token, 0)
+
+            oi_change_pct = 0.0
+            if prev_oi > 0:
+                oi_change_pct = round((curr_oi - prev_oi) / prev_oi * 100, 2)
+
+            opt_type = inst["instrument_type"]
+            strike = inst["strike"]
+            result["strike_oi"][(strike, opt_type)] = {
+                "oi": curr_oi,
+                "prev_oi": prev_oi,
+                "oi_change_pct": oi_change_pct,
+            }
+
+            # Aggregate for ATM ± 3 strikes
+            if opt_type == "CE":
+                total_ce_oi += curr_oi
+                total_ce_prev_oi += prev_oi
+            else:
+                total_pe_oi += curr_oi
+                total_pe_prev_oi += prev_oi
+
+        # Aggregate change %
+        if total_ce_prev_oi > 0:
+            result["ce_oi_change_pct"] = round(
+                (total_ce_oi - total_ce_prev_oi) / total_ce_prev_oi * 100, 2
+            )
+        if total_pe_prev_oi > 0:
+            result["pe_oi_change_pct"] = round(
+                (total_pe_oi - total_pe_prev_oi) / total_pe_prev_oi * 100, 2
+            )
+
+        logger.info(
+            f"OI Analysis: CE OI change {result['ce_oi_change_pct']:+.1f}%, "
+            f"PE OI change {result['pe_oi_change_pct']:+.1f}% "
+            f"(ATM {atm_strike}, {len(result['strike_oi'])} strikes analysed)"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # IV Percentile estimation (heuristic without full IV history)
+    # ------------------------------------------------------------------
+    def _estimate_iv_percentile(self, iv_current: float, tte_days: float) -> float:
+        """
+        Estimate IV percentile rank using a heuristic approach.
+        NIFTY weekly options typical IV range: 8-40%.
+        Returns 0-100 percentile value.
+        """
+        # Typical NIFTY IV ranges by TTE
+        if tte_days <= 1:
+            # Expiry day: IV is usually higher but collapses fast
+            iv_low, iv_high = 10.0, 60.0
+        elif tte_days <= 3:
+            iv_low, iv_high = 8.0, 45.0
+        elif tte_days <= 7:
+            iv_low, iv_high = 9.0, 35.0
+        else:
+            iv_low, iv_high = 10.0, 30.0
+
+        if iv_current <= iv_low:
+            return 5.0
+        if iv_current >= iv_high:
+            return 95.0
+
+        # Linear interpolation within range
+        pct = ((iv_current - iv_low) / (iv_high - iv_low)) * 100.0
+        return round(min(max(pct, 0.0), 100.0), 1)
+
+    # ------------------------------------------------------------------
+    # Gap-day classification
+    # ------------------------------------------------------------------
+    def _compute_gap_classification(self, df: pd.DataFrame):
+        """
+        Detect gap-up / gap-down based on today's open vs previous close.
+        Updates self._gap_type and self._gap_pct.
+        """
+        try:
+            today = date.today()
+            # Get today's open (first 5m candle of today)
+            if "date" in df.columns:
+                df_today = df[pd.to_datetime(df["date"]).dt.date == today]
+            else:
+                df_today = df[df.index.date == today] if hasattr(df.index, 'date') else df.tail(78)
+
+            if df_today.empty or len(df_today) < 1:
+                return
+
+            today_open = float(df_today.iloc[0]["open"])
+
+            # Get yesterday's close (last candle before today)
+            if "date" in df.columns:
+                df_prev = df[pd.to_datetime(df["date"]).dt.date < today]
+            else:
+                df_prev = df[df.index.date < today] if hasattr(df.index, 'date') else pd.DataFrame()
+
+            if df_prev.empty:
+                return
+
+            prev_close = float(df_prev.iloc[-1]["close"])
+            if prev_close <= 0:
+                return
+
+            gap_pct = ((today_open - prev_close) / prev_close) * 100.0
+            self._gap_pct = round(gap_pct, 3)
+
+            large_thr = settings.large_gap_threshold_pct
+            gap_thr = settings.gap_threshold_pct
+
+            if abs(gap_pct) >= large_thr:
+                self._gap_type = "LARGE_GAP_UP" if gap_pct > 0 else "LARGE_GAP_DOWN"
+            elif abs(gap_pct) >= gap_thr:
+                self._gap_type = "GAP_UP" if gap_pct > 0 else "GAP_DOWN"
+            else:
+                self._gap_type = "NONE"
+
+            if self._gap_type != "NONE":
+                logger.info(f"Gap-day detected: {self._gap_type} ({self._gap_pct:+.2f}%)")
+
+        except Exception as e:
+            logger.debug(f"Gap classification failed: {e}")
+            self._gap_type = "NONE"
+            self._gap_pct = 0.0
+
+    # ------------------------------------------------------------------
+    # Multi-timeframe data: fetch 15m + 1h and compute Supertrend
+    # ------------------------------------------------------------------
+    def _fetch_multi_tf_data(self, kite: KiteClient):
+        """
+        Fetch 15-minute and 1-hour candles, compute Supertrend on each,
+        and store the latest direction in self._st_dir_15m / self._st_dir_1h.
+        """
+        if not settings.enable_multi_tf:
+            return
+
+        token = self._resolve_nifty_token(kite)
+        if token is None:
+            return
+
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(days=10)
+
+        for interval, attr_name in [("15minute", "_st_dir_15m"), ("hour", "_st_dir_1h")]:
+            try:
+                raw = kite.get_historical_data(token, from_dt, to_dt, interval)
+                if raw:
+                    df_tf = pd.DataFrame(raw)
+                    if len(df_tf) >= 14:
+                        df_tf = self.strategy.compute_supertrend(df_tf)
+                        if "st_dir" in df_tf.columns:
+                            setattr(self, attr_name, int(df_tf.iloc[-1]["st_dir"]))
+                            logger.debug(
+                                f"Multi-TF {interval}: st_dir={getattr(self, attr_name)}"
+                            )
+            except Exception as e:
+                logger.debug(f"Multi-TF {interval} fetch failed: {e}")
+
+    # ------------------------------------------------------------------
     # Build option candidates from chain
     # ------------------------------------------------------------------
     def _build_candidates(
@@ -171,29 +688,36 @@ class NiftyOptionsEngine:
         spot: float,
         signal_dir: int,
         df_spot: pd.DataFrame,
+        instrument_name: str = "NIFTY",
     ) -> List[OptionCandidate]:
         """
-        Fetch NFO options chain near ATM, filter by delta 0.3–0.6,
+        Fetch NFO options chain near ATM, filter by delta,
         build OptionCandidate objects.
+        
+        Args:
+            instrument_name: "NIFTY" or "BANKNIFTY" (uses INSTRUMENT_CONFIG)
         """
         candidates = []
+        inst_cfg = INSTRUMENT_CONFIG.get(instrument_name, INSTRUMENT_CONFIG["NIFTY"])
+        strike_gap = inst_cfg["strike_gap"]
+        nfo_name = inst_cfg["nfo_name"]
         try:
             nfo_instruments = kite.get_instruments("NFO")
         except Exception as e:
             logger.error(f"Failed to fetch NFO instruments: {e}")
             return candidates
 
-        # Current expiry: nearest Thursday (weekly)
+        # Current expiry: nearest weekly
         today = date.today()
         nifty_options = [
             i for i in nfo_instruments
-            if i.get("name") == "NIFTY"
+            if i.get("name") == nfo_name
             and i.get("segment") == "NFO-OPT"
             and i.get("expiry")
             and i["expiry"] >= today
         ]
         if not nifty_options:
-            logger.warning("No NIFTY options found in NFO instruments")
+            logger.warning(f"No {nfo_name} options found in NFO instruments")
             return candidates
 
         # Sort by expiry, take nearest
@@ -202,11 +726,11 @@ class NiftyOptionsEngine:
         weekly_opts = [i for i in nifty_options if i["expiry"] == nearest_expiry]
 
         # ATM strike
-        atm_strike = round(spot / NIFTY_STRIKE_GAP) * NIFTY_STRIKE_GAP
+        atm_strike = round(spot / strike_gap) * strike_gap
         strike_range = range(
-            int(atm_strike - 5 * NIFTY_STRIKE_GAP),
-            int(atm_strike + 6 * NIFTY_STRIKE_GAP),
-            NIFTY_STRIKE_GAP,
+            int(atm_strike - 5 * strike_gap),
+            int(atm_strike + 6 * strike_gap),
+            strike_gap,
         )
 
         # Filter CE if bullish, PE if bearish (plus some of the other side for hedging)
@@ -218,6 +742,22 @@ class NiftyOptionsEngine:
 
         if not relevant:
             return candidates
+
+        # --- OI Analysis: fetch previous day OI + compute CE/PE change % ---
+        oi_data = {"strike_oi": {}, "ce_oi_change_pct": 0.0, "pe_oi_change_pct": 0.0}
+        try:
+            oi_data = self._fetch_oi_analysis(
+                kite, weekly_opts, atm_strike, spot, nearest_expiry,
+                strike_gap=strike_gap,
+            )
+            # Cache for strategy confirmation use
+            self._cached_oi_data = oi_data
+        except Exception as e:
+            logger.warning(f"OI analysis failed ({type(e).__name__}): {e}")
+
+        ce_oi_chg = oi_data.get("ce_oi_change_pct", 0.0)
+        pe_oi_chg = oi_data.get("pe_oi_change_pct", 0.0)
+        strike_oi = oi_data.get("strike_oi", {})
 
         # Fetch quotes for these instruments
         symbols = [f"NFO:{i['tradingsymbol']}" for i in relevant[:20]]
@@ -257,12 +797,31 @@ class NiftyOptionsEngine:
 
             delta = self.estimate_delta(spot, inst["strike"], tte_days, iv, primary_type)
 
-            # Delta filter: 0.3 – 0.6
-            if abs(delta) < 0.30 or abs(delta) > 0.60:
+            # Delta filter: use expiry-day-aware delta range
+            is_expiry_day = (nearest_expiry == today)
+            if is_expiry_day:
+                d_min = settings.expiry_day_delta_min
+                d_max = settings.expiry_day_delta_max
+            else:
+                d_min = settings.delta_min
+                d_max = settings.delta_max
+            if abs(delta) < d_min or abs(delta) > d_max:
+                continue
+
+            # Skip buying options on expiry day if disabled
+            if is_expiry_day and not settings.allow_expiry_day_buys:
                 continue
 
             # Volume spike: compare to 20-bar option volume (simple: use daily volume > 5000)
             vol_spike = volume > 5000  # simplified threshold
+
+            # OI change % for this specific strike
+            strike_oi_info = strike_oi.get((inst["strike"], primary_type), {})
+            oi_change_pct = strike_oi_info.get("oi_change_pct", 0.0)
+            prev_oi = strike_oi_info.get("prev_oi", 0)
+
+            # IV Percentile estimation (compare current IV to typical range)
+            iv_pct_val = self._estimate_iv_percentile(iv * 100, tte_days)
 
             c = OptionCandidate(
                 tradingsymbol=inst["tradingsymbol"],
@@ -278,6 +837,17 @@ class NiftyOptionsEngine:
                 oi=oi,
                 bid=bid,
                 ask=ask,
+                oi_change_pct=oi_change_pct,
+                ce_oi_change_pct=ce_oi_chg,
+                pe_oi_change_pct=pe_oi_chg,
+                prev_oi=prev_oi,
+                iv_percentile=iv_pct_val,
+                tte_days=tte_days,
+                is_expiry_day=is_expiry_day,
+                gap_type=self._gap_type,
+                gap_pct=self._gap_pct,
+                supertrend_15m=self._st_dir_15m,
+                supertrend_1h=self._st_dir_1h,
                 orb_high=self.orb_high or 0,
                 orb_low=self.orb_low or 0,
                 supertrend_dir=st_dir,
@@ -285,6 +855,7 @@ class NiftyOptionsEngine:
                 macd_hist_prev=macd_hist_prev,
                 vol_spike=vol_spike,
                 atr=atr_val,
+                price_source="live",
             )
             candidates.append(c)
 
@@ -293,79 +864,90 @@ class NiftyOptionsEngine:
     # ------------------------------------------------------------------
     # Execute trade on top candidate
     # ------------------------------------------------------------------
-    def _execute_trade(self, kite: KiteClient, candidate: OptionCandidate) -> Optional[TradeRecord]:
-        risk_check = self.risk_mgr.can_take_trade(
-            abs(candidate.ltp) * NIFTY_LOT_SIZE * 0.05  # rough risk estimate
+    def _execute_trade(
+        self, kite: KiteClient, candidate: OptionCandidate, qty_factor: float = 1.0
+    ) -> Optional[ManagedPosition]:
+        """
+        Execute a trade using smart SL levels and auto order management.
+        Uses VWAP/CPR/S-R based SL and targets mapped to option premium via delta.
+        qty_factor: multiplier for position sizing (e.g. 0.5 when VIX is elevated).
+        """
+        # Compute smart levels on NIFTY spot
+        direction = "BUY" if candidate.option_type == "CE" else "SELL"
+        levels = self._cached_levels or IntraDayLevels(
+            orb_high=self.orb_high or 0,
+            orb_low=self.orb_low or 0,
+            atr=candidate.atr,
         )
-        if not risk_check["allowed"]:
-            logger.warning(f"Trade blocked: {risk_check['reasons']}")
-            return None
+
+        smart = compute_smart_levels(
+            entry=candidate.spot_price,
+            direction=direction,
+            levels=levels,
+        )
+
+        # Map spot SL/targets to option premium via delta
+        SmartSLEngine.map_to_option_premium(
+            smart=smart,
+            option_entry=candidate.entry_price if candidate.entry_price > 0 else candidate.ltp,
+            delta=candidate.delta,
+            direction=direction,
+        )
+
+        # Calculate quantity from risk
+        entry_price = candidate.entry_price if candidate.entry_price > 0 else candidate.ltp
+        risk_per_unit = abs(entry_price - smart.option_sl)
+        if risk_per_unit <= 0:
+            risk_per_unit = entry_price * 0.10  # fallback 10%
 
         qty = self.risk_mgr.calculate_quantity(
-            candidate.ltp,
-            candidate.ltp * 0.7,  # 30% SL on option premium
-            NIFTY_LOT_SIZE,
+            entry_price, smart.option_sl, settings.nifty_lot_size
         )
+        # Apply VIX-based size reduction
+        if qty_factor < 1.0 and qty > settings.nifty_lot_size:
+            reduced_lots = max(1, int((qty / settings.nifty_lot_size) * qty_factor))
+            qty = reduced_lots * settings.nifty_lot_size
+            logger.info(f"Qty reduced by factor {qty_factor}: {qty} units")
         if qty <= 0:
             return None
 
-        # Compute SL and target for option premium
-        sl = round(candidate.ltp * 0.70, 2)  # 30% SL on premium
-        target = round(candidate.ltp * 1.60, 2)  # 60% target on premium
-        trailing_sl = round(candidate.ltp * 0.80, 2)
-
-        tx_type = "BUY"
-        result = kite.place_order(
-            tradingsymbol=candidate.tradingsymbol,
-            exchange="NFO",
-            transaction_type=tx_type,
-            quantity=qty,
-            order_type="MARKET",
-            product="MIS",
-            tag="NiftyORB",
-        )
-
-        if not result.get("success"):
-            logger.error(f"Order failed: {result}")
-            return None
-
-        trade = TradeRecord(
-            trade_id=result.get("order_id", str(uuid.uuid4())),
+        # Use AutoOrderManager for entry + SL placement
+        pos = self.order_mgr.enter_trade(
+            kite=kite,
             symbol=candidate.tradingsymbol,
             option_type=candidate.option_type,
-            entry_price=candidate.ltp,
-            entry_time=datetime.now().isoformat(),
+            smart_levels=smart,
             quantity=qty,
-            sl=sl,
-            target=target,
-            trailing_sl=trailing_sl,
+            delta=candidate.delta,
             score=candidate.score,
         )
-        self.risk_mgr.register_trade(trade)
-        telegram.alert_trade_entry(
-            symbol=candidate.tradingsymbol,
-            option_type=candidate.option_type,
-            entry_price=candidate.ltp,
-            qty=qty,
-            sl=sl,
-            target=target,
-            score=candidate.score,
-            trade_id=trade.trade_id,
-        )
-        return trade
+
+        return pos
 
     # ------------------------------------------------------------------
     # Square off all positions
     # ------------------------------------------------------------------
     def square_off_all(self, kite: KiteClient, reason: str = "SQUARED_OFF"):
+        """Square off all open positions via auto order manager."""
+        # Collect positions that will be squared off for journal recording
+        pre_close_positions = {}
+        for tid, trade in self.risk_mgr.open_positions.items():
+            pre_close_positions[tid] = trade
+        for tid, pos in self.order_mgr.positions.items():
+            if pos.status != "CLOSED":
+                pre_close_positions[tid] = pos
+
+        # Square off via auto order manager (handles SL cancellation + market sell)
+        self.order_mgr.square_off_all(kite, reason)
+
+        # Also handle any positions in the old risk manager that aren't in order_mgr
         positions = self.risk_mgr.get_square_off_list()
         for trade in positions:
+            if trade.trade_id in self.order_mgr.positions:
+                continue  # already handled by order_mgr
             try:
-                # Get current LTP
                 ltp_data = kite.get_ltp([f"NFO:{trade.symbol}"])
                 ltp = ltp_data.get(f"NFO:{trade.symbol}", {}).get("last_price", trade.entry_price)
-
-                # Place exit order
                 kite.place_order(
                     tradingsymbol=trade.symbol,
                     exchange="NFO",
@@ -385,8 +967,21 @@ class NiftyOptionsEngine:
                     )
             except Exception as e:
                 logger.error(f"Square-off failed for {trade.symbol}: {e}")
-        telegram.alert_square_off(len(positions), self.risk_mgr.daily_pnl)
+
         self.dashboard_state["engine_status"] = "SQUARED_OFF"
+
+        # Record all squared-off trades in journal
+        for tid in pre_close_positions:
+            trade = self.risk_mgr.trades
+            for t in trade:
+                if t.trade_id == tid and t.status != "OPEN":
+                    self.journal.close_candidate(
+                        trade_id=tid,
+                        exit_price=t.exit_price,
+                        pnl=t.pnl,
+                        exit_reason=reason,
+                    )
+                    break
 
     # ------------------------------------------------------------------
     # Offline / market-closed data fetch
@@ -487,8 +1082,15 @@ class NiftyOptionsEngine:
 
             if self.all_candidates:
                 self.scored_candidates = self.scorer.rank_candidates(
-                    self.all_candidates, top_pct=10.0
+                    self.all_candidates, top_pct=10.0,
+                    levels=self._cached_levels,
                 )
+
+        # Refresh LTPs with live data to ensure entry/SL/targets are accurate
+        if self._oi_feed and self._oi_feed.is_running and self.scored_candidates:
+            self._update_candidates_from_live_oi()
+        elif kite.is_connected and self.scored_candidates:
+            self._refresh_candidate_ltps(kite)
 
         self.dashboard_state["engine_status"] = "MARKET_CLOSED"
         self.dashboard_state["nifty_spot"] = self.nifty_spot
@@ -501,6 +1103,17 @@ class NiftyOptionsEngine:
         self.dashboard_state["risk"] = self.risk_mgr.get_status()
         self.dashboard_state["trades"] = self.risk_mgr.get_trades_summary()
         self.dashboard_state["cycle_count"] = self._cycle_count
+        # OI analysis — use live WebSocket data if available
+        if self._oi_feed and self._oi_feed.is_running:
+            self.dashboard_state["oi_analysis"] = self._oi_feed.get_dashboard_data()
+        else:
+            self.dashboard_state["oi_analysis"] = {
+                "source": "rest_api",
+                "connected": False,
+                "ce_oi_change_pct": self._cached_oi_data.get("ce_oi_change_pct", 0) if self._cached_oi_data else 0,
+                "pe_oi_change_pct": self._cached_oi_data.get("pe_oi_change_pct", 0) if self._cached_oi_data else 0,
+                "pcr": self._cached_oi_data.get("pcr", 0) if self._cached_oi_data else 0,
+            }
         self.dashboard_state["last_update"] = datetime.now().isoformat()
         return self.dashboard_state
 
@@ -508,49 +1121,271 @@ class NiftyOptionsEngine:
     # Monitor open positions (SL / target / trailing)
     # ------------------------------------------------------------------
     def monitor_positions(self, kite: KiteClient):
-        if not self.risk_mgr.open_positions:
+        """
+        Monitor open positions using the ExitSignalGenerator + TrailingSLManager.
+
+        Every cycle:
+        1. Update watermark (highest premium) and compute trailing SL
+        2. If TSL improved → update SL order on broker
+        3. Check exit conditions (SL hit, targets, supertrend, MACD, VWAP, time)
+        4. Execute exits if triggered
+
+        The trailing SL manager ensures winning trades are protected and
+        the trade stays alive as long as the trend continues.
+        """
+        if not self.order_mgr.positions:
             return
 
-        ltp_map = {}
-        for tid, trade in list(self.risk_mgr.open_positions.items()):
+        df = self._cached_df
+        vwap = self._cached_levels.vwap if self._cached_levels else 0.0
+        spot = self.nifty_spot
+
+        # Compute spot ATR for option ATR estimation
+        spot_atr = 0.0
+        try:
+            if df is not None and len(df) > 14:
+                spot_atr = float(self.strategy.calculate_atr(df).iloc[-1])
+        except Exception:
+            pass
+
+        for trade_id, pos in list(self.order_mgr.positions.items()):
+            if pos.status == "CLOSED" or pos.remaining_qty <= 0:
+                continue
+
             try:
-                data = kite.get_ltp([f"NFO:{trade.symbol}"])
-                ltp = data.get(f"NFO:{trade.symbol}", {}).get("last_price", 0)
+                # Get current LTP
+                data = kite.get_ltp([f"NFO:{pos.symbol}"])
+                ltp = data.get(f"NFO:{pos.symbol}", {}).get("last_price", 0)
                 if ltp <= 0:
                     continue
-                ltp_map[tid] = ltp
 
-                # Check SL / target
-                action = self.risk_mgr.check_sl_target(tid, ltp)
-                if action:
-                    kite.place_order(
-                        tradingsymbol=trade.symbol,
-                        exchange="NFO",
-                        transaction_type="SELL",
-                        quantity=trade.quantity,
-                        order_type="MARKET",
-                        product="MIS",
-                        tag=action,
-                    )
-                    closed = self.risk_mgr.close_trade(tid, ltp, action)
-                    if closed:
-                        telegram.alert_trade_exit(
-                            symbol=closed.symbol, option_type=closed.option_type,
-                            entry_price=closed.entry_price, exit_price=ltp,
-                            qty=closed.quantity, pnl=closed.pnl,
-                            reason=action, trade_id=closed.trade_id,
+                # --- Step 1: Run Trailing SL Manager ---
+                option_atr = TrailingSLManager.estimate_option_atr(
+                    spot_atr=spot_atr,
+                    delta=pos.delta,
+                    entry_price=pos.entry_price,
+                )
+
+                t1 = pos.smart_levels.option_t1 if pos.smart_levels else ltp * 1.3
+                t2 = pos.smart_levels.option_t2 if pos.smart_levels else ltp * 1.6
+                t3 = pos.smart_levels.option_t3 if pos.smart_levels else ltp * 2.0
+
+                new_tsl, new_phase, new_highest, tsl_updated = self.tsl_mgr.compute_trailing_sl(
+                    entry_price=pos.entry_price,
+                    current_ltp=ltp,
+                    current_tsl=pos.trailing_sl,
+                    highest_price=pos.highest_price,
+                    trailing_phase=pos.trailing_phase,
+                    t1_hit=pos.t1_hit,
+                    t2_hit=pos.t2_hit,
+                    t3_hit=pos.t3_hit,
+                    target1=t1,
+                    target2=t2,
+                    target3=t3,
+                    option_atr=option_atr,
+                    df=df,
+                    spot_atr=spot_atr,
+                    delta=pos.delta,
+                )
+
+                # Update position state
+                pos.highest_price = new_highest
+                pos.trailing_phase = new_phase
+
+                if tsl_updated:
+                    old_tsl = pos.trailing_sl
+                    pos.trailing_sl = new_tsl
+                    pos.last_tsl_update = datetime.now().isoformat()
+
+                    # Update SL order on broker
+                    if self.auto_trade_mode in ("paper", "live"):
+                        self._update_broker_sl(kite, pos, new_tsl)
+
+                    # Telegram alert for significant TSL moves
+                    gain_pct = ((ltp - pos.entry_price) / pos.entry_price * 100) if pos.entry_price > 0 else 0
+                    if new_phase != "INITIAL":
+                        telegram._send(
+                            f"🛡️ <b>TSL UPDATE: {pos.symbol}</b>\n"
+                            f"SL: ₹{old_tsl:.2f} → <b>₹{new_tsl:.2f}</b>\n"
+                            f"Phase: {new_phase}\n"
+                            f"LTP: ₹{ltp:.2f} | Gain: {gain_pct:+.1f}%\n"
+                            f"Watermark: ₹{new_highest:.2f}\n"
+                            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
                         )
-                else:
-                    # Update trailing SL
-                    atr_val = 0
-                    if self.all_candidates:
-                        atr_val = self.all_candidates[0].atr
-                    if atr_val > 0:
-                        self.risk_mgr.update_trailing_sl(tid, ltp, atr_val)
-            except Exception as e:
-                logger.error(f"Monitor error for {trade.symbol}: {e}")
 
-        self.risk_mgr.update_unrealised(ltp_map)
+                # --- Step 2: Build position context with ACTUAL trailing SL ---
+                ctx = PositionContext(
+                    trade_id=trade_id,
+                    symbol=pos.symbol,
+                    option_type=pos.option_type,
+                    entry_price=pos.entry_price,
+                    current_ltp=ltp,
+                    quantity=pos.quantity,
+                    remaining_qty=pos.remaining_qty,
+                    stop_loss=pos.smart_levels.option_sl if pos.smart_levels else ltp * 0.70,
+                    trailing_sl=pos.trailing_sl,  # Now uses ACTUAL tracked TSL
+                    target1=t1,
+                    target2=t2,
+                    target3=t3,
+                    t1_hit=pos.t1_hit,
+                    t2_hit=pos.t2_hit,
+                    t3_hit=pos.t3_hit,
+                    entry_time=pos.created_at,
+                )
+
+                # --- Step 3: Check VWAP cross on spot ---
+                vwap_applicable = False
+                if vwap > 0 and spot > 0:
+                    if pos.option_type == "CE" and spot < vwap:
+                        vwap_applicable = True
+                    elif pos.option_type == "PE" and spot > vwap:
+                        vwap_applicable = True
+
+                # --- Step 4: Evaluate exit conditions ---
+                exit_sig = self.exit_gen.evaluate(
+                    pos=ctx,
+                    df=df,
+                    vwap=vwap if vwap_applicable else 0.0,
+                )
+
+                if exit_sig:
+                    logger.info(
+                        f"EXIT SIGNAL for {pos.symbol}: {exit_sig.reason.value} "
+                        f"({exit_sig.priority.value}) exit_pct={exit_sig.exit_pct} "
+                        f"tsl_phase={pos.trailing_phase}"
+                    )
+
+                    # If exit signal has a new TSL, apply it (only if higher)
+                    if exit_sig.new_trailing_sl and exit_sig.new_trailing_sl > pos.trailing_sl:
+                        pos.trailing_sl = exit_sig.new_trailing_sl
+                        pos.last_tsl_update = datetime.now().isoformat()
+                        if self.auto_trade_mode in ("paper", "live"):
+                            self._update_broker_sl(kite, pos, exit_sig.new_trailing_sl)
+
+                    # Send Telegram alert for exit signal (not for TSL-only tightenings)
+                    if exit_sig.exit_pct > 0:
+                        telegram._send(
+                            f"🚪 <b>EXIT SIGNAL: {exit_sig.reason.value}</b>\n"
+                            f"Symbol: {pos.symbol}\n"
+                            f"Priority: {exit_sig.priority.value}\n"
+                            f"Exit %: {exit_sig.exit_pct * 100:.0f}%\n"
+                            f"LTP: ₹{ltp:.2f} | TSL: ₹{pos.trailing_sl:.2f}\n"
+                            f"Phase: {pos.trailing_phase}\n"
+                            f"{exit_sig.message}\n"
+                            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                        )
+
+                    # --- Step 5: Auto-execute the exit if auto-trading is on ---
+                    if self.auto_trade_mode in ("paper", "live") and exit_sig.exit_pct > 0:
+                        self.order_mgr.handle_exit_signal(kite, trade_id, exit_sig)
+
+                        # Record in journal if position is now closed
+                        updated_pos = self.order_mgr.positions.get(trade_id)
+                        if updated_pos and updated_pos.status == "CLOSED":
+                            pnl = (ltp - pos.entry_price) * pos.quantity
+                            self.journal.close_candidate(
+                                trade_id=trade_id,
+                                exit_price=ltp,
+                                pnl=pnl,
+                                exit_reason=exit_sig.reason.value,
+                            )
+                            # Record SL hit for re-entry cooldown
+                            if exit_sig.reason.value in ("SL_HIT", "TRAILING_SL_HIT"):
+                                direction = "BUY" if pos.option_type == "CE" else "SELL"
+                                self.record_sl_hit(direction)
+
+            except Exception as e:
+                logger.error(f"Monitor error for {pos.symbol}: {e}")
+
+    def _update_broker_sl(
+        self, kite: KiteClient, pos: ManagedPosition, new_tsl: float
+    ):
+        """Cancel old SL order and place new one at updated trailing SL."""
+        try:
+            if pos.sl_order_id:
+                kite.cancel_order(pos.sl_order_id)
+                logger.info(f"Cancelled old SL order {pos.sl_order_id} for {pos.symbol}")
+
+            new_sl_result = kite.place_sl_order(
+                tradingsymbol=pos.symbol,
+                exchange="NFO",
+                transaction_type="SELL",
+                quantity=pos.remaining_qty,
+                trigger_price=round(new_tsl, 2),
+                product="MIS",
+                tag=f"AutoTSL_{pos.trailing_phase}",
+            )
+            if new_sl_result.get("success"):
+                pos.sl_order_id = new_sl_result.get("order_id", "")
+                logger.info(
+                    f"Broker SL updated: {pos.symbol} TSL=₹{new_tsl:.2f} "
+                    f"phase={pos.trailing_phase} qty={pos.remaining_qty}"
+                )
+            else:
+                logger.warning(f"Broker SL update failed for {pos.symbol}: {new_sl_result}")
+        except Exception as e:
+            logger.error(f"Error updating broker SL for {pos.symbol}: {e}")
+
+    # ------------------------------------------------------------------
+    # WebSocket Tick Integration
+    # ------------------------------------------------------------------
+    def start_websocket_feed(self, kite: KiteClient):
+        """
+        Start WebSocket tick feed for real-time position monitoring.
+        Subscribes to NIFTY spot + all active position instruments.
+        Only starts if settings.use_websocket_ticks is True.
+        """
+        if not settings.use_websocket_ticks:
+            return
+
+        tokens = set()
+        # NIFTY spot token
+        nifty_token = self._resolve_nifty_token(kite)
+        if nifty_token:
+            tokens.add(nifty_token)
+
+        # Active position tokens
+        for pos in self.order_mgr.positions.values():
+            if pos.status != "CLOSED" and hasattr(pos, "instrument_token"):
+                tokens.add(pos.instrument_token)
+
+        if not tokens:
+            return
+
+        def on_tick(ticks):
+            """Handle incoming ticks — update LTPs for positions."""
+            for tick in ticks:
+                token = tick.get("instrument_token")
+                if token:
+                    self._tick_data[token] = {
+                        "ltp": tick.get("last_price", 0),
+                        "bid": tick.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                        "ask": tick.get("depth", {}).get("sell", [{}])[0].get("price", 0),
+                        "volume": tick.get("volume_traded", 0),
+                        "oi": tick.get("oi", 0),
+                        "timestamp": datetime.now().isoformat(),
+                    }
+
+                    # Update NIFTY spot if it's the spot token
+                    if token == nifty_token:
+                        self.nifty_spot = tick.get("last_price", self.nifty_spot)
+
+        def on_connect(ws, response):
+            self._ws_connected = True
+            logger.info(f"WebSocket connected, subscribed to {len(tokens)} instruments")
+
+        try:
+            kite.start_ticker(list(tokens), on_tick=on_tick, on_connect=on_connect)
+            logger.info("WebSocket tick feed started")
+        except Exception as e:
+            logger.error(f"WebSocket start failed: {e}")
+
+    def get_tick_ltp(self, instrument_token: int) -> Optional[float]:
+        """Get latest tick LTP for an instrument. Returns None if no tick data."""
+        tick = self._tick_data.get(instrument_token)
+        if tick:
+            return tick.get("ltp")
+        return None
 
     # ------------------------------------------------------------------
     # Main cycle – called every 5 minutes by scheduler
@@ -615,14 +1450,142 @@ class NiftyOptionsEngine:
 
         self.nifty_spot = df["close"].iloc[-1]
 
-        # -- Generate signal from ORB strategy --
-        signal = self.strategy.generate_signal(df, "NIFTY")
+        # -- Start Live OI Feed (once, after we have spot price) --
+        self._start_oi_feed(kite)
+
+        # -- Fetch India VIX for safety filter --
+        vix = self._fetch_india_vix(kite)
+        if vix > settings.vix_max_threshold and vix > 0:
+            logger.warning(f"India VIX {vix:.1f} > max threshold {settings.vix_max_threshold}. Skipping new trades.")
+            self.dashboard_state["engine_status"] = "VIX_TOO_HIGH"
+            self.dashboard_state["india_vix"] = vix
+            # Still monitor existing positions even when VIX is high
+            try:
+                self.monitor_positions(kite)
+            except Exception as e:
+                logger.warning(f"Position monitoring failed ({type(e).__name__}): {e}")
+            self._update_dashboard()
+            return self.dashboard_state
+
+        # -- Compute indicators on spot data for candidate building --
+        df = self.strategy.compute_supertrend(df)
+        df = self.strategy.compute_macd(df)
+
+        # -- Gap-day classification (once per day, after ORB) --
+        if self._gap_type == "NONE" and self._cycle_count <= 2:
+            self._compute_gap_classification(df)
+
+        # -- Multi-timeframe Supertrend (15m + 1h) --
+        if self._cycle_count <= 1 or self._cycle_count % 3 == 0:
+            # Refresh multi-TF every ~15 min (every 3 cycles)
+            try:
+                self._fetch_multi_tf_data(kite)
+            except Exception as e:
+                logger.debug(f"Multi-TF fetch error: {e}")
+
+        # -- Compute VWAP / CPR / S-R levels --
+        self._cached_levels = self.level_calc.compute(
+            df, orb_high=self.orb_high or 0, orb_low=self.orb_low or 0
+        )
+        self._cached_df = df
+
+        st_dir = int(df.iloc[-1].get("st_dir", 1)) if "st_dir" in df.columns else 1
+        macd_hist = float(df.iloc[-1].get("macd_hist", 0)) if "macd_hist" in df.columns else 0.0
+        macd_hist_prev = float(df.iloc[-2].get("macd_hist", 0)) if len(df) > 1 and "macd_hist" in df.columns else 0.0
+        try:
+            atr_val = float(self.strategy.calculate_atr(df).iloc[-1])
+        except Exception:
+            atr_val = 0.0
+
+        # -- Generate signal from ORB strategy (with OI data if available) --
+        # Prefer live OI from WebSocket feed over cached REST-fetched OI
+        live_oi = self._get_live_oi_data()
+        if live_oi:
+            self._cached_oi_data = live_oi
+            logger.debug(
+                f"Using live OI: PCR={live_oi.get('pcr', 0):.3f}, "
+                f"CE OI chg={live_oi.get('ce_oi_change_pct', 0):+.1f}%, "
+                f"PE OI chg={live_oi.get('pe_oi_change_pct', 0):+.1f}%"
+            )
+        signal = self.strategy.generate_signal(df, "NIFTY", oi_data=self._cached_oi_data or None)
+
+        # -- Try VWAP mean reversion if ORB has no signal --
+        if signal is None and settings.enable_vwap_strategy:
+            try:
+                vwap_signal = self.vwap_strategy.generate_signal(
+                    df, "NIFTY",
+                    levels=self._cached_levels,
+                    orb_high=self.orb_high or 0,
+                    orb_low=self.orb_low or 0,
+                    india_vix=self._india_vix,
+                    gap_type=self._gap_type,
+                )
+                if vwap_signal:
+                    signal = vwap_signal
+                    logger.info(f"VWAP MR signal activated: {vwap_signal.signal.value}")
+            except Exception as e:
+                logger.debug(f"VWAP strategy error: {e}")
+
+        # -- Try expiry premium sell if enabled and no signal yet --
+        if signal is None and settings.enable_expiry_sell_strategy:
+            try:
+                expiry_signal = self.expiry_strategy.generate_signal(
+                    df, "NIFTY",
+                    india_vix=self._india_vix,
+                    orb_high=self.orb_high or 0,
+                    orb_low=self.orb_low or 0,
+                    gap_type=self._gap_type,
+                )
+                if expiry_signal:
+                    signal = expiry_signal
+                    logger.info(f"Expiry sell signal activated")
+            except Exception as e:
+                logger.debug(f"Expiry strategy error: {e}")
+
         self.last_signal = signal
 
         # -- Monitor existing positions --
-        self.monitor_positions(kite)
+        try:
+            self.monitor_positions(kite)
+        except Exception as e:
+            logger.warning(f"Position monitoring failed ({type(e).__name__}): {e}")
 
-        # -- If we have a signal and capacity, score and trade --
+        # Determine direction: from signal if available, else from Supertrend
+        if signal is not None:
+            signal_dir = 1 if signal.signal == SignalType.BUY else -1
+        else:
+            signal_dir = st_dir  # use Supertrend direction as fallback
+
+        # -- Always build + score candidates after ORB capture --
+        try:
+            self.all_candidates = self._build_candidates(kite, self.nifty_spot, signal_dir, df)
+        except Exception as e:
+            logger.warning(f"Kite candidate build failed ({type(e).__name__}): {e}")
+            self.all_candidates = []
+
+        # If Kite quotes failed, use B-S/yfinance fallback
+        if not self.all_candidates:
+            logger.info("Using fallback candidate builder (B-S estimates)")
+            self.all_candidates = build_option_candidates_from_instruments(
+                kite_client=kite,
+                spot=self.nifty_spot,
+                signal_dir=signal_dir,
+                orb_high=self.orb_high or 0,
+                orb_low=self.orb_low or 0,
+                st_dir=st_dir,
+                macd_hist=macd_hist,
+                macd_hist_prev=macd_hist_prev,
+                atr_val=atr_val,
+            )
+
+        self.scored_candidates = self.scorer.rank_candidates(
+            self.all_candidates, top_pct=20.0, levels=self._cached_levels
+        )
+
+        # Update candidates with live OI/LTP from WebSocket (if running)
+        self._update_candidates_from_live_oi()
+
+        # -- If we have a signal, trade and alert --
         if signal is not None:
             self.dashboard_state["engine_status"] = "SIGNAL_ACTIVE"
             self.dashboard_state["signal"] = {
@@ -635,35 +1598,138 @@ class NiftyOptionsEngine:
                 "reasoning": signal.reasoning,
             }
 
-            telegram.alert_signal(
+            # Add levels info to dashboard
+            if self._cached_levels:
+                lvls = self._cached_levels
+                self.dashboard_state["levels"] = {
+                    "vwap": lvls.vwap,
+                    "vwap_upper_1": lvls.vwap_upper_1,
+                    "vwap_lower_1": lvls.vwap_lower_1,
+                    "pivot": lvls.pivot,
+                    "r1": lvls.r1, "r2": lvls.r2, "r3": lvls.r3,
+                    "s1": lvls.s1, "s2": lvls.s2, "s3": lvls.s3,
+                    "pdh": lvls.pdh, "pdl": lvls.pdl,
+                    "orb_high": lvls.orb_high, "orb_low": lvls.orb_low,
+                    "atr": lvls.atr,
+                }
+
+            # Only alert once per unique signal direction+entry
+            sig_key = f"{signal.signal.value}@{round(signal.entry_price, 1)}"
+            if sig_key != self._alerted_signal_key:
+                self._alerted_signal_key = sig_key
+                telegram.alert_signal(
+                    signal_type=signal.signal.value,
+                    entry=signal.entry_price,
+                    sl=signal.stop_loss,
+                    target=signal.target,
+                    confidence=signal.confidence,
+                    conditions=signal.conditions_met,
+                    reasoning=signal.reasoning,
+                )
+
+            # Record signal & candidates in journal
+            sig_id = self.journal.record_signal(
                 signal_type=signal.signal.value,
-                entry=signal.entry_price,
-                sl=signal.stop_loss,
+                spot_price=self.nifty_spot,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
                 target=signal.target,
                 confidence=signal.confidence,
                 conditions=signal.conditions_met,
                 reasoning=signal.reasoning,
+                source="ORB_BREAKOUT",
             )
+            if self.scored_candidates:
+                self.journal.record_candidates(sig_id, self.scored_candidates)
 
-            # Prepare spot df with indicators for scoring
-            df = self.strategy.compute_supertrend(df)
-            df = self.strategy.compute_macd(df)
+            # Execute on top candidate(s) via auto order manager
+            if self.auto_trade_mode in ("paper", "live"):
+                # --- Safety filter: minimum confidence threshold ---
+                if signal.confidence < settings.min_confidence_threshold:
+                    logger.info(
+                        f"Signal confidence {signal.confidence:.0f}% < min threshold "
+                        f"{settings.min_confidence_threshold:.0f}%. Skipping trade execution."
+                    )
+                    telegram.send_message(
+                        f"⚠️ Signal skipped (low confidence {signal.confidence:.0f}% "
+                        f"< {settings.min_confidence_threshold:.0f}%)"
+                    )
+                # --- Safety filter: re-entry cooldown after SL hit ---
+                elif self._check_reentry_cooldown("BUY" if signal.signal == SignalType.BUY else "SELL"):
+                    logger.info("Re-entry cooldown active. Skipping trade execution.")
+                    telegram.send_message(
+                        f"⏳ Signal skipped (re-entry cooldown after SL hit, "
+                        f"wait {settings.reentry_cooldown_minutes} min)"
+                    )
+                else:
+                    # --- VIX-based position size reduction ---
+                    vix_size_factor = 1.0
+                    if self._india_vix > settings.vix_reduce_size_threshold:
+                        vix_size_factor = 0.5
+                        logger.info(
+                            f"India VIX {self._india_vix:.1f} > {settings.vix_reduce_size_threshold}. "
+                            f"Reducing position size by 50%."
+                        )
 
-            signal_dir = 1 if signal.signal == SignalType.BUY else -1
-
-            # Build and score candidates
-            self.all_candidates = self._build_candidates(kite, self.nifty_spot, signal_dir, df)
-            self.scored_candidates = self.scorer.rank_candidates(self.all_candidates, top_pct=10.0)
-
-            # Execute on top candidate(s)
-            for cand in self.scored_candidates:
-                if len(self.risk_mgr.open_positions) >= self.risk_mgr.max_concurrent:
-                    break
-                self._execute_trade(kite, cand)
+                    for cand in self.scored_candidates:
+                        if len(self.order_mgr.positions) >= self.risk_mgr.max_concurrent:
+                            break
+                        # Skip strikes already attempted this session
+                        if cand.tradingsymbol in self._traded_strikes:
+                            continue
+                        # Only execute if position is not already open for this symbol
+                        existing = [p for p in self.order_mgr.positions.values()
+                                    if p.symbol == cand.tradingsymbol and p.status != "CLOSED"]
+                        if not existing:
+                            self._traded_strikes.add(cand.tradingsymbol)
+                            pos = self._execute_trade(kite, cand, qty_factor=vix_size_factor)
+                            if pos:
+                                self.journal.activate_candidate(
+                                    symbol=cand.tradingsymbol,
+                                    trade_id=pos.trade_id,
+                                    entry_price=pos.entry_price,
+                                    quantity=pos.quantity,
+                                )
 
         else:
             self.dashboard_state["engine_status"] = "MONITORING"
             self.dashboard_state["signal"] = None
+
+        # -- Send top candidates via Telegram every cycle --
+        if self.scored_candidates:
+            # Only alert candidates with strikes not already sent
+            new_candidates = [
+                c for c in self.scored_candidates[:5]
+                if c.tradingsymbol not in self._alerted_strikes
+            ]
+            if new_candidates:
+                top_summary = [
+                    {
+                        "symbol": c.tradingsymbol,
+                        "display_name": c.display_name,
+                        "type": c.option_type,
+                        "strike": c.strike,
+                        "expiry": c.expiry,
+                        "delta": c.delta,
+                        "iv": c.iv,
+                        "score": c.score,
+                        "ltp": c.ltp,
+                        "entry": c.entry_price,
+                        "stoploss": c.stoploss,
+                        "target1": c.target1,
+                        "target2": c.target2,
+                        "target3": c.target3,
+                        "risk_reward_pct": c.risk_reward_pct,
+                        "oi_change_pct": c.oi_change_pct,
+                        "ce_oi_change_pct": c.ce_oi_change_pct,
+                        "pe_oi_change_pct": c.pe_oi_change_pct,
+                        "oi_interpretation": c.oi_interpretation,
+                    }
+                    for c in new_candidates
+                ]
+                telegram.alert_top_candidates(top_summary)
+                for c in new_candidates:
+                    self._alerted_strikes.add(c.tradingsymbol)
 
         self._update_dashboard()
         return self.dashboard_state
@@ -672,6 +1738,17 @@ class NiftyOptionsEngine:
     # Dashboard state
     # ------------------------------------------------------------------
     def _update_dashboard(self):
+        # Refresh candidates from live OI feed first (preferred), then fallback to get_ltp
+        try:
+            if self._oi_feed and self._oi_feed.is_running and self.scored_candidates:
+                self._update_candidates_from_live_oi()
+            else:
+                kite = KiteClient.get_instance()
+                if kite.is_connected and self.scored_candidates:
+                    self._refresh_candidate_ltps(kite)
+        except Exception:
+            pass
+
         self.dashboard_state["risk"] = self.risk_mgr.get_status()
         self.dashboard_state["trades"] = self.risk_mgr.get_trades_summary()
         self.dashboard_state["top_candidates"] = self.scorer.score_summary(
@@ -679,7 +1756,56 @@ class NiftyOptionsEngine:
         ) if self.scored_candidates else {"count": 0, "top": []}
         self.dashboard_state["nifty_spot"] = self.nifty_spot
         self.dashboard_state["cycle_count"] = self._cycle_count
+        self.dashboard_state["auto_trade_mode"] = self.auto_trade_mode
+        self.dashboard_state["active_positions"] = self.order_mgr.get_active_positions()
+        self.dashboard_state["order_log"] = self.order_mgr.get_order_log()
+        if self._cached_levels:
+            lvls = self._cached_levels
+            self.dashboard_state["levels"] = {
+                "vwap": lvls.vwap,
+                "vwap_upper_1": lvls.vwap_upper_1,
+                "vwap_lower_1": lvls.vwap_lower_1,
+                "pivot": lvls.pivot,
+                "r1": lvls.r1, "r2": lvls.r2, "r3": lvls.r3,
+                "s1": lvls.s1, "s2": lvls.s2, "s3": lvls.s3,
+                "pdh": lvls.pdh, "pdl": lvls.pdl,
+                "orb_high": lvls.orb_high, "orb_low": lvls.orb_low,
+                "atr": lvls.atr,
+            }
         self.dashboard_state["last_update"] = datetime.now().isoformat()
+
+        # Safety filters info for dashboard
+        self.dashboard_state["india_vix"] = self._india_vix
+        self.dashboard_state["safety_filters"] = {
+            "india_vix": self._india_vix,
+            "min_confidence": settings.min_confidence_threshold,
+            "vix_max": settings.vix_max_threshold,
+            "vix_reduce": settings.vix_reduce_size_threshold,
+            "cooldown_min": settings.reentry_cooldown_minutes,
+            "daily_orders_used": self.order_mgr._daily_order_count,
+            "daily_orders_limit": settings.auto_trade_max_orders_per_day,
+            "max_orders": settings.auto_trade_max_orders_per_day,
+            "gap_type": self._gap_type,
+            "gap_pct": self._gap_pct,
+            "st_dir_15m": self._st_dir_15m,
+            "st_dir_1h": self._st_dir_1h,
+            "vwap_enabled": settings.enable_vwap_strategy,
+            "expiry_sell_enabled": settings.enable_expiry_sell_strategy,
+            "trend_mode_enabled": settings.enable_trend_mode,
+        }
+
+        # OI analysis data for dashboard — use live WebSocket data if available
+        if self._oi_feed and self._oi_feed.is_running:
+            oi_dashboard = self._oi_feed.get_dashboard_data()
+            self.dashboard_state["oi_analysis"] = oi_dashboard
+        else:
+            self.dashboard_state["oi_analysis"] = {
+                "source": "rest_api",
+                "connected": False,
+                "ce_oi_change_pct": self._cached_oi_data.get("ce_oi_change_pct", 0) if self._cached_oi_data else 0,
+                "pe_oi_change_pct": self._cached_oi_data.get("pe_oi_change_pct", 0) if self._cached_oi_data else 0,
+                "pcr": self._cached_oi_data.get("pcr", 0) if self._cached_oi_data else 0,
+            }
 
     def get_dashboard(self) -> Dict:
         return self.dashboard_state

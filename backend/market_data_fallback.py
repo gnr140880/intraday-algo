@@ -116,6 +116,55 @@ def _estimate_option_price(spot: float, strike: float, tte_days: float,
     return round(max(0, price), 2)
 
 
+def _fetch_india_vix_iv() -> float:
+    """
+    Fetch India VIX as a proxy for NIFTY options IV.
+    Returns IV as a decimal (e.g. 0.15 for 15%). Falls back to 0.15.
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("^INDIAVIX")
+        hist = ticker.history(period="5d")
+        if not hist.empty:
+            vix_val = float(hist["Close"].iloc[-1])
+            if vix_val > 0:
+                # VIX is annual vol in %. Convert to decimal and add
+                # a premium for weekly options (typically 1.2-1.5x VIX)
+                iv = (vix_val / 100) * 1.3  # 30% premium over VIX for weekly options
+                logger.info(f"Fallback: India VIX={vix_val:.1f}, using IV={iv*100:.1f}%")
+                return max(0.10, min(0.60, iv))
+    except Exception as e:
+        logger.debug(f"VIX-based IV fetch failed: {e}")
+    return 0.15
+
+
+def _try_fetch_live_ltp(kite_client, symbols: List[str]) -> Dict[str, float]:
+    """
+    Try to fetch live LTP for a list of NFO symbols via Kite get_ltp.
+    Returns {symbol: ltp} for any that succeed.
+    """
+    result = {}
+    if not symbols:
+        return result
+    try:
+        nfo_symbols = [f"NFO:{s}" for s in symbols]
+        # Batch in groups of 20
+        for i in range(0, len(nfo_symbols), 20):
+            batch = nfo_symbols[i:i+20]
+            ltp_data = kite_client.get_ltp(batch)
+            for key, val in ltp_data.items():
+                ltp = val.get("last_price", 0)
+                if ltp > 0:
+                    # Strip "NFO:" prefix
+                    sym = key.replace("NFO:", "")
+                    result[sym] = ltp
+        if result:
+            logger.info(f"Fallback: fetched live LTP for {len(result)} options via Kite")
+    except Exception as e:
+        logger.debug(f"Kite LTP fetch for options failed: {e}")
+    return result
+
+
 def build_option_candidates_from_instruments(
     kite_client,
     spot: float,
@@ -132,6 +181,9 @@ def build_option_candidates_from_instruments(
     """
     Build OptionCandidate-compatible dicts using Kite instruments metadata
     + Black-Scholes estimated prices/delta.  No quote API needed.
+
+    Attempts to use India VIX for realistic IV, and Kite get_ltp for
+    actual live option prices whenever possible.
     """
     from scoring_engine import OptionCandidate
 
@@ -174,16 +226,47 @@ def build_option_candidates_from_instruments(
     if tte_days < 1:
         tte_days = 0.5
 
+    # Use VIX-based IV instead of flat default for more accurate pricing
+    iv = _fetch_india_vix_iv()
+    # For near-expiry options, IV tends to be even higher due to gamma risk
+    if tte_days <= 1:
+        iv = iv * 1.4  # Expiry-day IV premium
+    elif tte_days <= 3:
+        iv = iv * 1.2  # Near-expiry IV premium
+
+    # Try to fetch live LTP for all relevant options via Kite
+    live_ltp_map = _try_fetch_live_ltp(
+        kite_client, [i["tradingsymbol"] for i in relevant]
+    )
+
     for inst in relevant:
-        iv = default_iv
         delta = _estimate_delta(spot, inst["strike"], tte_days, iv, primary_type)
 
         # Delta filter: 0.3 – 0.6
         if abs(delta) < 0.30 or abs(delta) > 0.60:
             continue
 
+        # Prefer live LTP over B-S estimate
+        live_ltp = live_ltp_map.get(inst["tradingsymbol"], 0)
         est_price = _estimate_option_price(spot, inst["strike"], tte_days, iv, primary_type)
-        if est_price <= 0:
+
+        if live_ltp > 0:
+            option_price = live_ltp
+            # Back-calculate IV from live price for better delta estimate
+            # (live price is ground truth)
+            if est_price > 0 and abs(est_price - live_ltp) / max(live_ltp, 1) > 0.15:
+                # Significant price difference → adjust IV proportionally
+                iv_adj = iv * (live_ltp / max(est_price, 1))
+                iv_adj = max(0.08, min(0.80, iv_adj))
+                delta = _estimate_delta(spot, inst["strike"], tte_days, iv_adj, primary_type)
+                logger.debug(
+                    f"{inst['tradingsymbol']}: live={live_ltp:.1f} vs est={est_price:.1f}, "
+                    f"adjusted IV {iv*100:.1f}%→{iv_adj*100:.1f}%"
+                )
+        else:
+            option_price = est_price
+
+        if option_price <= 0:
             continue
 
         # Estimated volume/OI from moneyness (synthetic – better than nothing)
@@ -191,20 +274,25 @@ def build_option_candidates_from_instruments(
         est_volume = int(max(5000, 50000 * (1 - moneyness * 10)))
         est_oi = est_volume * 3
 
+        # Realistic bid/ask spread: use ~0.5-1% for liquid options
+        spread_pct = 0.005 if abs(delta) > 0.40 else 0.01
+        bid = round(option_price * (1 - spread_pct), 2)
+        ask = round(option_price * (1 + spread_pct), 2)
+
         c = OptionCandidate(
             tradingsymbol=inst["tradingsymbol"],
             instrument_token=inst["instrument_token"],
             strike=inst["strike"],
             option_type=primary_type,
             expiry=str(nearest_expiry),
-            ltp=est_price,
+            ltp=option_price,
             spot_price=spot,
             delta=delta,
             iv=round(iv * 100, 2),
             volume=est_volume,
             oi=est_oi,
-            bid=round(est_price * 0.98, 2),
-            ask=round(est_price * 1.02, 2),
+            bid=bid,
+            ask=ask,
             orb_high=orb_high,
             orb_low=orb_low,
             supertrend_dir=st_dir,
@@ -212,8 +300,15 @@ def build_option_candidates_from_instruments(
             macd_hist_prev=macd_hist_prev,
             vol_spike=est_volume > 10000,
             atr=atr_val,
+            tte_days=tte_days,
+            is_expiry_day=(nearest_expiry == today),
+            price_source="live" if live_ltp > 0 else "estimated",
         )
         candidates.append(c)
 
-    logger.info(f"Fallback: built {len(candidates)} candidates (estimated, delta 0.3–0.6)")
+    price_source = f"live LTP ({len(live_ltp_map)})" if live_ltp_map else "B-S estimated"
+    logger.info(
+        f"Fallback: built {len(candidates)} candidates "
+        f"(IV={iv*100:.1f}%, prices={price_source}, delta 0.3–0.6)"
+    )
     return candidates

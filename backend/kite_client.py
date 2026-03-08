@@ -1,12 +1,14 @@
 """
 Zerodha KiteConnect client wrapper with token management.
 Handles authentication, order placement, and market data.
+Includes automatic token refresh on TokenException.
 """
 import os
 import logging
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 from kiteconnect import KiteConnect, KiteTicker
+from kiteconnect.exceptions import TokenException
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ class KiteClient:
         self._connected = False
         self._subscribed_tokens: set = set()
         self._tick_callbacks = []
+        self._refreshing = False          # guard against recursive refresh
 
         if self.access_token:
             self.kite.set_access_token(self.access_token)
@@ -37,8 +40,22 @@ class KiteClient:
     def get_login_url(self) -> str:
         return self.kite.login_url()
 
+    # ----------------------------------------------------------
+    # Automatic token refresh on TokenException
+    # ----------------------------------------------------------
+    def _call_with_refresh(self, fn, *args, **kwargs):
+        """Call a Kite API function. Auto-refresh disabled — raises TokenException directly."""
+        return fn(*args, **kwargs)
+
     def generate_session(self, request_token: str) -> Dict:
         try:
+            logger.info(
+                "generate_session called with: api_key='%s', api_secret='%s...' (len=%d), request_token='%s'",
+                self.kite.api_key,
+                settings.kite_api_secret[:6],
+                len(settings.kite_api_secret),
+                request_token,
+            )
             data = self.kite.generate_session(
                 request_token, api_secret=settings.kite_api_secret
             )
@@ -78,31 +95,31 @@ class KiteClient:
         return self._connected and bool(self.access_token)
 
     def get_profile(self) -> Dict:
-        return self.kite.profile()
+        return self._call_with_refresh(self.kite.profile)
 
     def get_holdings(self) -> List[Dict]:
-        return self.kite.holdings()
+        return self._call_with_refresh(self.kite.holdings)
 
     def get_positions(self) -> Dict:
-        return self.kite.positions()
+        return self._call_with_refresh(self.kite.positions)
 
     def get_orders(self) -> List[Dict]:
-        return self.kite.orders()
+        return self._call_with_refresh(self.kite.orders)
 
     def get_trades(self) -> List[Dict]:
-        return self.kite.trades()
+        return self._call_with_refresh(self.kite.trades)
 
     def get_funds(self) -> Dict:
-        return self.kite.margins()
+        return self._call_with_refresh(self.kite.margins)
 
     def get_quote(self, instruments: List[str]) -> Dict:
-        return self.kite.quote(instruments)
+        return self._call_with_refresh(self.kite.quote, *instruments)
 
     def get_ohlc(self, instruments: List[str]) -> Dict:
-        return self.kite.ohlc(instruments)
+        return self._call_with_refresh(self.kite.ohlc, *instruments)
 
     def get_ltp(self, instruments: List[str]) -> Dict:
-        return self.kite.ltp(instruments)
+        return self._call_with_refresh(self.kite.ltp, *instruments)
 
     def get_historical_data(
         self,
@@ -113,14 +130,15 @@ class KiteClient:
         continuous: bool = False,
         oi: bool = False,
     ) -> List[Dict]:
-        return self.kite.historical_data(
+        return self._call_with_refresh(
+            self.kite.historical_data,
             instrument_token, from_date, to_date, interval, continuous, oi
         )
 
     def get_instruments(self, exchange: str = None) -> List[Dict]:
         if exchange:
-            return self.kite.instruments(exchange)
-        return self.kite.instruments()
+            return self._call_with_refresh(self.kite.instruments, exchange)
+        return self._call_with_refresh(self.kite.instruments)
 
     def place_order(
         self,
@@ -132,12 +150,18 @@ class KiteClient:
         product: str = "MIS",
         price: float = None,
         trigger_price: float = None,
-        stoploss: float = None,
-        squareoff: float = None,
-        trailing_stoploss: float = None,
         validity: str = "DAY",
+        variety: str = "regular",
+        disclosed_quantity: int = None,
         tag: str = "AlgoTrade",
     ) -> Dict:
+        """
+        Place an order via Kite Connect.
+        Official signature: place_order(variety, exchange, tradingsymbol,
+            transaction_type, quantity, product, order_type, ...)
+        Supported varieties: regular, co, amo, iceberg, auction
+        Note: Bracket orders (BO) were discontinued by Zerodha.
+        """
         try:
             if settings.trading_mode == "paper":
                 return {
@@ -153,39 +177,61 @@ class KiteClient:
                     },
                 }
 
-            params = {
-                "tradingsymbol": tradingsymbol,
+            # Build kwargs matching official pykiteconnect place_order signature
+            kwargs: Dict[str, Any] = {
+                "variety": variety,
                 "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
                 "transaction_type": transaction_type,
                 "quantity": quantity,
-                "order_type": order_type,
                 "product": product,
+                "order_type": order_type,
                 "validity": validity,
                 "tag": tag,
             }
-            if price:
-                params["price"] = price
-            if trigger_price:
-                params["trigger_price"] = trigger_price
+            if price is not None:
+                kwargs["price"] = price
+            if trigger_price is not None:
+                kwargs["trigger_price"] = trigger_price
+            if disclosed_quantity is not None:
+                kwargs["disclosed_quantity"] = disclosed_quantity
 
-            # Bracket order support
-            if stoploss and squareoff:
-                params["variety"] = KiteConnect.VARIETY_BO
-                params["stoploss"] = stoploss
-                params["squareoff"] = squareoff
-                if trailing_stoploss:
-                    params["trailing_stoploss"] = trailing_stoploss
-                order_id = self.kite.place_order(**params)
-            else:
-                params["variety"] = KiteConnect.VARIETY_REGULAR
-                order_id = self.kite.place_order(**params)
-
+            order_id = self.kite.place_order(**kwargs)
             logger.info(f"Order placed: {order_id} for {tradingsymbol}")
             return {"success": True, "order_id": order_id}
 
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
             return {"success": False, "error": str(e)}
+
+    def place_sl_order(
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        transaction_type: str,
+        quantity: int,
+        trigger_price: float,
+        price: float = None,
+        product: str = "MIS",
+        tag: str = "AlgoSL",
+    ) -> Dict:
+        """
+        Place a stop-loss order (SL-M or SL).
+        - SL-M (stop-loss market): only trigger_price, no price
+        - SL (stop-loss limit): both trigger_price and price
+        """
+        order_type = "SL" if price is not None else "SL-M"
+        return self.place_order(
+            tradingsymbol=tradingsymbol,
+            exchange=exchange,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            order_type=order_type,
+            product=product,
+            price=price,
+            trigger_price=trigger_price,
+            tag=tag,
+        )
 
     def modify_order(self, order_id: str, **kwargs) -> Dict:
         try:

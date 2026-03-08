@@ -11,6 +11,7 @@ Alert types:
   - Auto square-off (3:15 PM)
   - Daily loss limit hit
   - Daily P&L summary
+  - EOD Trade Journal report (comprehensive)
   - Engine status changes
   - News sentiment shift
 
@@ -281,19 +282,39 @@ class TelegramAlerter:
             return
         if not candidates:
             return
-        lines = []
-        for i, c in enumerate(candidates[:5], 1):
-            lines.append(
-                f"  {i}. {c.get('symbol', '?')} Δ{c.get('delta', 0):.2f} "
-                f"Score:<b>{c.get('score', 0):.1f}</b> ₹{c.get('ltp', 0):.2f}"
+
+        for c in candidates[:3]:
+            name = c.get('display_name', c.get('symbol', '?'))
+            opt = c.get('type', '')
+            expiry = c.get('expiry', '')
+            entry = c.get('entry', c.get('ltp', 0))
+            sl = c.get('stoploss', 0)
+            t1 = c.get('target1', 0)
+            t2 = c.get('target2', 0)
+            t3 = c.get('target3', 0)
+            rr_pct = c.get('risk_reward_pct', 0)
+            score = c.get('score', 0)
+            delta = c.get('delta', 0)
+            iv = c.get('iv', 0)
+
+            text = (
+                f"‼️ <b>{name}</b> ‼️\n"
+                f"\n"
+                f"✅ BUY ABOVE - <b>{entry:.0f}</b>\n"
+                f"\n"
+                f"💰 TGT 1 - <b>{t1:.0f}</b>\n"
+                f"💰 TGT 2 - <b>{t2:.0f}</b>\n"
+                f"💰 TGT 3 - <b>{t3:.0f}++</b>\n"
+                f"\n"
+                f"❗ SL - <b>{sl:.0f}</b>\n"
+                f"\n"
+                f"📊 Risk/Reward: <b>{rr_pct:.1f}%</b>\n"
+                f"Δ {delta:.2f} | IV {iv:.1f}% | Score {score:.0f}/100\n"
+                f"\n"
+                f"<b>#{expiry.replace('-', '')} Expiry</b>\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
             )
-        text = (
-            "🏆 <b>TOP CANDIDATES</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n".join(lines)
-            + f"\n⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        self._send(text)
+            self._send(text)
 
     # ------------------------------------------------------------------
     # Alert: News sentiment shift
@@ -310,6 +331,19 @@ class TelegramAlerter:
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         )
         self._send(text)
+
+    # ------------------------------------------------------------------
+    # Alert: EOD Trade Journal Report (comprehensive)
+    # ------------------------------------------------------------------
+    def alert_eod_journal(self, journal_messages: List[str]):
+        """
+        Send comprehensive EOD trade journal report.
+        Accepts pre-formatted messages from TradeJournal.generate_eod_telegram().
+        """
+        if not self._rate_ok("eod_journal"):
+            return
+        for msg in journal_messages:
+            self._send(msg)
 
     # ------------------------------------------------------------------
     # Generic alert

@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict, Any
 from strategies.base_strategy import BaseStrategy, TradeSignal, SignalType
+from level_calculator import LevelCalculator, IntraDayLevels
+from smart_sl_engine import SmartSLEngine, SmartLevels, compute_smart_levels
 from datetime import datetime
 
 
@@ -15,6 +17,17 @@ class SupertrendStrategy(BaseStrategy):
     timeframe = "5m"
     min_bars = 60
 
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        self.level_calc = LevelCalculator()
+        self.sl_engine = SmartSLEngine(
+            min_sl_atr_mult=0.5,
+            max_sl_atr_mult=2.0,
+            default_sl_atr_mult=1.0,
+            target_min_rr=1.5,
+        )
+        self._cached_levels: Optional[IntraDayLevels] = None
+
     def default_params(self) -> Dict[str, Any]:
         return {
             "atr_period": 10,
@@ -23,6 +36,11 @@ class SupertrendStrategy(BaseStrategy):
             "ema_slow": 50,
             "trailing_atr_multiplier": 1.5,
             "risk_reward_min": 1.5,
+            # Smart SL params
+            "min_sl_atr_mult": 0.5,
+            "max_sl_atr_mult": 2.0,
+            "default_sl_atr_mult": 1.0,
+            "target_min_rr": 1.5,
         }
 
     def calculate_supertrend(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -82,15 +100,37 @@ class SupertrendStrategy(BaseStrategy):
                 conditions_met.append(f"Price {entry:.2f} > EMA50 {curr['ema_slow']:.2f}")
                 if curr["ema_fast"] > curr["ema_slow"]:
                     conditions_met.append("EMA20 > EMA50 (uptrend confirmed)")
-                sl = round(curr["supertrend"] - atr * 0.5, 2)
-                target = round(entry + (entry - sl) * self.params["risk_reward_min"], 2)
-                trailing = self.calculate_trailing_sl(entry, SignalType.BUY, atr, self.params["trailing_atr_multiplier"])
+
+                # Smart SL using VWAP/CPR/S-R levels
+                levels = self.level_calc.compute(df)
+                self._cached_levels = levels
+                smart = compute_smart_levels(
+                    entry=entry, direction="BUY", levels=levels,
+                    min_sl_atr=self.params.get("min_sl_atr_mult", 0.5),
+                    max_sl_atr=self.params.get("max_sl_atr_mult", 2.0),
+                    default_sl_atr=self.params.get("default_sl_atr_mult", 1.0),
+                    target_min_rr=self.params.get("target_min_rr", 1.5),
+                )
+                sl = smart.stop_loss
+                target = smart.target1
+                trailing = smart.trailing_sl
+
+                conditions_met.append(f"SL at {sl:.2f} ({smart.sl_type})")
+                conditions_met.append(f"T1={smart.target1:.2f} T2={smart.target2:.2f} T3={smart.target3:.2f}")
+                conditions_met.append(f"R:R {smart.risk_reward}")
+                if levels.vwap > 0:
+                    conditions_met.append(f"VWAP: {levels.vwap:.2f}")
+
                 signal = TradeSignal(
                     symbol=symbol, signal=SignalType.BUY,
                     entry_price=entry, stop_loss=sl, target=target,
                     trailing_sl=trailing, confidence=80.0,
                     strategy_name=self.name,
-                    reasoning=f"Supertrend flip bullish at {entry}. EMA trend aligned.",
+                    reasoning=(
+                        f"Supertrend flip bullish at {entry}. EMA trend aligned. "
+                        f"SL at {smart.sl_type} ({sl:.2f}), "
+                        f"Targets: T1={smart.target1:.2f} T2={smart.target2:.2f} T3={smart.target3:.2f}"
+                    ),
                     conditions_met=conditions_met, timeframe=self.timeframe,
                     timestamp=datetime.now().isoformat(),
                 )
@@ -100,17 +140,41 @@ class SupertrendStrategy(BaseStrategy):
             if curr["close"] < curr["ema_slow"]:
                 conditions_met.append("Supertrend flipped BEARISH")
                 conditions_met.append(f"Price {entry:.2f} < EMA50 {curr['ema_slow']:.2f}")
-                sl = round(curr["supertrend"] + atr * 0.5, 2)
-                target = round(entry - (sl - entry) * self.params["risk_reward_min"], 2)
-                trailing = self.calculate_trailing_sl(entry, SignalType.SELL, atr, self.params["trailing_atr_multiplier"])
+
+                # Smart SL using VWAP/CPR/S-R levels
+                levels = self.level_calc.compute(df)
+                self._cached_levels = levels
+                smart = compute_smart_levels(
+                    entry=entry, direction="SELL", levels=levels,
+                    min_sl_atr=self.params.get("min_sl_atr_mult", 0.5),
+                    max_sl_atr=self.params.get("max_sl_atr_mult", 2.0),
+                    default_sl_atr=self.params.get("default_sl_atr_mult", 1.0),
+                    target_min_rr=self.params.get("target_min_rr", 1.5),
+                )
+                sl = smart.stop_loss
+                target = smart.target1
+                trailing = smart.trailing_sl
+
+                conditions_met.append(f"SL at {sl:.2f} ({smart.sl_type})")
+                conditions_met.append(f"T1={smart.target1:.2f} T2={smart.target2:.2f} T3={smart.target3:.2f}")
+                conditions_met.append(f"R:R {smart.risk_reward}")
+
                 signal = TradeSignal(
                     symbol=symbol, signal=SignalType.SELL,
                     entry_price=entry, stop_loss=sl, target=target,
                     trailing_sl=trailing, confidence=78.0,
                     strategy_name=self.name,
-                    reasoning=f"Supertrend flip bearish at {entry}. EMA trend aligned.",
+                    reasoning=(
+                        f"Supertrend flip bearish at {entry}. EMA trend aligned. "
+                        f"SL at {smart.sl_type} ({sl:.2f}), "
+                        f"Targets: T1={smart.target1:.2f} T2={smart.target2:.2f} T3={smart.target3:.2f}"
+                    ),
                     conditions_met=conditions_met, timeframe=self.timeframe,
                     timestamp=datetime.now().isoformat(),
                 )
 
         return signal
+
+    def get_cached_levels(self) -> Optional[IntraDayLevels]:
+        """Return the last computed levels."""
+        return self._cached_levels

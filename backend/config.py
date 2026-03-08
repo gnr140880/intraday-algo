@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings
 from typing import List
 import os
+from pathlib import Path
+
+_ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -8,6 +11,9 @@ class Settings(BaseSettings):
     kite_api_secret: str = ""
     kite_access_token: str = ""
     kite_request_token: str = ""
+    kite_user_id: str = ""         # Zerodha client ID (e.g. "AB1234")
+    kite_password: str = ""        # Zerodha login password
+    kite_totp_secret: str = ""     # Base32 TOTP secret from Zerodha 2FA setup
     news_api_key: str = ""
     app_secret_key: str = "supersecretkey"
     database_url: str = "sqlite+aiosqlite:///./algo_trading.db"
@@ -18,7 +24,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 
     # --- NIFTY Options Engine ---
-    nifty_lot_size: int = 25
+    nifty_lot_size: int = 75                  # NIFTY lot size (75 as of 2025)
     orb_minutes: int = 15
     daily_loss_limit_pct: float = 2.0
     max_risk_per_trade_pct: float = 1.0
@@ -27,8 +33,81 @@ class Settings(BaseSettings):
     delta_min: float = 0.30
     delta_max: float = 0.60
     top_score_pct: float = 10.0             # trade only top 10%
-    engine_cycle_seconds: int = 300         # 5-minute cycle
+    engine_cycle_seconds: int = 60          # 1-minute cycle
     vol_spike_multiplier: float = 1.5
+
+    # --- Smart SL Engine ---
+    min_sl_atr_mult: float = 0.5            # min SL distance = 0.5×ATR
+    max_sl_atr_mult: float = 2.0            # max SL distance = 2×ATR
+    default_sl_atr_mult: float = 1.0        # default SL if no structural level
+    target_min_rr: float = 1.5              # minimum risk:reward for T1
+
+    # --- Auto Trading ---
+    auto_trade_enabled: bool = True          # enable auto order placement
+    auto_trade_max_orders_per_day: int = 10  # safety limit
+
+    # --- Safety Filters ---
+    min_confidence_threshold: float = 50.0   # skip signals below this confidence
+    vix_max_threshold: float = 25.0          # skip trades when India VIX > this
+    vix_reduce_size_threshold: float = 18.0  # reduce qty by 50% when VIX > this
+    reentry_cooldown_minutes: int = 30       # wait N minutes after SL hit before re-entry same direction
+
+    # --- TREND Mode ---
+    enable_trend_mode: bool = False          # TREND mode disabled by default (whipsaw risk)
+    trend_mode_min_confidence: float = 55.0  # separate higher threshold for TREND signals
+    trend_mode_min_votes: int = 3            # require 3/3 votes instead of 2/3
+
+    # --- IV & Expiry ---
+    iv_reject_threshold: float = 85.0        # skip options above 85th percentile IV
+    expiry_day_early_exit_time: str = "14:30" # earlier square-off on expiry day
+    allow_expiry_day_buys: bool = True        # allow buying options on expiry day
+    expiry_day_delta_min: float = 0.40        # tighter delta range on expiry day
+    expiry_day_delta_max: float = 0.55
+
+    # --- Gap Day ---
+    gap_threshold_pct: float = 0.5           # ≥0.5% open vs prev close = gap day
+    large_gap_threshold_pct: float = 1.0     # ≥1.0% = large gap
+    gap_day_buffer_mult: float = 2.0         # widen ORB buffer on gap days
+
+    # --- Multi-Instrument ---
+    instruments_to_trade: str = "NIFTY"      # comma-separated: "NIFTY,BANKNIFTY"
+    banknifty_lot_size: int = 30
+    banknifty_strike_gap: int = 100
+
+    # --- Strategy Toggles ---
+    enable_vwap_strategy: bool = False       # VWAP mean-reversion (range-bound days)
+    enable_expiry_sell_strategy: bool = False # Expiry premium selling
+    vwap_range_bound_max_orb_pct: float = 0.5  # ORB range < 0.5% of spot = range-bound
+
+    # --- Multi-Timeframe ---
+    enable_multi_tf: bool = True             # use 15m + 1h confirmation
+    multi_tf_weight: int = 8                 # scoring weight for TF alignment
+
+    # --- Slippage ---
+    slippage_model_enabled: bool = True
+    slippage_fixed_pct: float = 0.05         # 0.05% fixed slippage component
+
+    # --- WebSocket Ticks ---
+    use_websocket_ticks: bool = False
+    tick_batch_interval_ms: int = 1000
+
+    # --- Live OI Feed (WebSocket) ---
+    enable_live_oi_feed: bool = True          # enable real-time OI via WebSocket
+    oi_feed_num_strikes: int = 10             # subscribe ATM ± N strikes (each side)
+    oi_feed_resubscribe_interval: int = 300   # re-center ATM every N seconds
+
+    # --- Trailing Stop-Loss ---
+    tsl_breakeven_trigger_pct: float = 3.0   # move SL to breakeven after X% gain
+    tsl_early_breakeven_pct: float = 5.0     # early breakeven threshold
+    tsl_trail_t1_atr_mult: float = 1.0       # ATR multiplier in TRAIL_T1 phase
+    tsl_trail_t2_atr_mult: float = 0.7       # ATR multiplier in TRAIL_T2 phase
+    tsl_tight_atr_mult: float = 0.5          # ATR multiplier in TIGHT phase
+    tsl_tight_trigger_pct: float = 80.0      # enter TIGHT phase at X%+ gain
+    tsl_trail_pct_initial: float = 15.0      # % trail from highs in TRAIL_T1
+    tsl_trail_pct_t2: float = 10.0           # % trail from highs in TRAIL_T2
+    tsl_trail_pct_tight: float = 6.0         # % trail from highs in TIGHT
+    tsl_swing_lookback: int = 3              # candles for swing-low trailing
+    tsl_sl_buffer_pct: float = 0.5           # place SL this % below calc level
 
     # --- Telegram Alerts ---
     telegram_bot_token: str = ""
@@ -39,7 +118,7 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.cors_origins.split(",")]
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         extra = "ignore"
 
 

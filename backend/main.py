@@ -16,6 +16,7 @@ import json
 
 from config import settings, NIFTY50_STOCKS, MIDCAP_WATCHLIST, FON_ACTIVES, GLOBAL_INDICES, INDIA_INDICES
 from kite_client import KiteClient
+# from auto_login import refresh_access_token, is_token_valid  # auto-login disabled
 from strategies.supertrend_strategy import SupertrendStrategy
 from strategies.nifty_options_orb import NiftyOptionsORBStrategy
 from options_engine import NiftyOptionsEngine
@@ -23,6 +24,7 @@ from scoring_engine import ScoringEngine
 from risk_manager import RiskManager
 from news_aggregator import news_aggregator
 from telegram_alerts import telegram
+from trade_journal import trade_journal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,10 +44,36 @@ def engine_cycle_job():
     """Scheduler job: runs engine cycle synchronously."""
     try:
         state = nifty_engine.run_cycle()
-        # Broadcast to WebSocket clients
-        asyncio.create_task(ws_dashboard_manager.broadcast(state))
+        # Broadcast to WebSocket clients via the running event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(ws_dashboard_manager.broadcast(state))
+            else:
+                loop.run_until_complete(ws_dashboard_manager.broadcast(state))
+        except RuntimeError:
+            # If no event loop available, skip broadcast (next HTTP poll will get it)
+            logger.debug("No event loop for WS broadcast, skipping")
     except Exception as e:
         logger.error(f"Engine cycle error: {e}")
+
+
+def eod_report_job():
+    """Scheduler job: sends comprehensive EOD trade journal report at 3:30 PM IST."""
+    try:
+        logger.info("EOD report job triggered")
+        risk_status = nifty_engine.risk_mgr.get_status()
+        messages = trade_journal.generate_eod_telegram(risk_status)
+        telegram.alert_eod_journal(messages)
+        logger.info(f"EOD report sent via Telegram ({len(messages)} messages)")
+    except Exception as e:
+        logger.error(f"EOD report job error: {e}")
+
+
+# Auto-login disabled — token_refresh_job removed
+# def token_refresh_job():
+#     """Scheduler job: refresh Kite access token daily at 6:05 AM IST."""
+#     ...
 
 
 # --- Pydantic request/response models ---
@@ -59,9 +87,8 @@ class OrderRequest(BaseModel):
     product: str = "MIS"
     price: Optional[float] = None
     trigger_price: Optional[float] = None
-    stoploss: Optional[float] = None
-    squareoff: Optional[float] = None
-    trailing_stoploss: Optional[float] = None
+    variety: str = "regular"  # regular, co, amo, iceberg, auction
+    disclosed_quantity: Optional[int] = None
 
 
 class ModifyOrderRequest(BaseModel):
@@ -93,8 +120,28 @@ async def lifespan(app: FastAPI):
         id="nifty_engine_cycle",
         replace_existing=True,
     )
+    # EOD report at 3:30 PM IST every weekday
+    scheduler.add_job(
+        eod_report_job,
+        "cron",
+        hour=15,
+        minute=30,
+        day_of_week="mon-fri",
+        id="eod_report",
+        replace_existing=True,
+    )
+    # Auto-login disabled — no scheduled token refresh
     scheduler.start()
     logger.info(f"Options engine scheduler started (every {settings.engine_cycle_seconds}s)")
+    logger.info("EOD report scheduled at 3:30 PM IST (Mon-Fri)")
+
+    # --- Manual login only ---
+    kite = KiteClient.get_instance()
+    if kite.access_token:
+        logger.info("Access token loaded from .env (use /api/auth/login-url if expired)")
+    else:
+        logger.warning("No access token in .env — use /api/auth/login-url to login manually")
+
     yield
     scheduler.shutdown(wait=False)
     logger.info("AlgoTest backend shutting down")
@@ -156,6 +203,12 @@ async def auth_callback(request_token: str):
 async def auth_status():
     kite = KiteClient.get_instance()
     return {"connected": kite.is_connected}
+
+
+# Auto-login disabled — refresh-token endpoint removed
+# @app.post("/api/auth/refresh-token")
+# async def refresh_token():
+#     ...
 
 
 # ============================================================
@@ -221,9 +274,8 @@ async def place_order(order: OrderRequest):
         product=order.product,
         price=order.price,
         trigger_price=order.trigger_price,
-        stoploss=order.stoploss,
-        squareoff=order.squareoff,
-        trailing_stoploss=order.trailing_stoploss,
+        variety=order.variety,
+        disclosed_quantity=order.disclosed_quantity,
     )
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
@@ -494,6 +546,9 @@ async def engine_status():
         "nifty_spot": nifty_engine.nifty_spot,
         "halted": nifty_engine.risk_mgr.is_halted,
         "open_positions": len(nifty_engine.risk_mgr.open_positions),
+        "auto_trade_mode": nifty_engine.auto_trade_mode,
+        "active_auto_positions": len([p for p in nifty_engine.order_mgr.positions.values() if p.status != "CLOSED"]),
+        "levels_computed": nifty_engine._cached_levels is not None,
     }
 
 
@@ -518,8 +573,12 @@ async def engine_trades():
 @app.post("/api/engine/run-cycle")
 async def engine_run_cycle():
     """Manually trigger one engine cycle (for testing)."""
-    state = nifty_engine.run_cycle()
-    return state
+    try:
+        state = nifty_engine.run_cycle()
+        return state
+    except Exception as e:
+        logger.exception("run_cycle failed")
+        return {"error": str(e), "engine_status": "ERROR"}
 
 
 @app.post("/api/engine/square-off")
@@ -538,6 +597,89 @@ async def engine_offline_data():
     """
     state = nifty_engine.fetch_offline_data()
     return state
+
+
+# ============================================================
+# Auto-Trading & Smart SL/Target API
+# ============================================================
+
+@app.get("/api/engine/levels")
+async def engine_levels():
+    """Current VWAP, CPR, S/R levels used for SL/target calculation."""
+    levels = nifty_engine._cached_levels
+    if levels is None:
+        return {"computed": False, "message": "Levels not yet computed. Run a cycle first."}
+    return {
+        "computed": True,
+        "vwap": levels.vwap,
+        "vwap_upper_1": levels.vwap_upper_1,
+        "vwap_lower_1": levels.vwap_lower_1,
+        "vwap_upper_2": levels.vwap_upper_2,
+        "vwap_lower_2": levels.vwap_lower_2,
+        "pivot": levels.pivot,
+        "bc": levels.bc,
+        "tc": levels.tc,
+        "r1": levels.r1, "r2": levels.r2, "r3": levels.r3,
+        "s1": levels.s1, "s2": levels.s2, "s3": levels.s3,
+        "pdh": levels.pdh, "pdl": levels.pdl, "pdc": levels.pdc,
+        "orb_high": levels.orb_high, "orb_low": levels.orb_low,
+        "nearest_support": levels.nearest_support,
+        "nearest_resistance": levels.nearest_resistance,
+        "support_levels": levels.support_levels,
+        "resistance_levels": levels.resistance_levels,
+        "atr": levels.atr,
+        "timestamp": levels.timestamp,
+    }
+
+
+@app.get("/api/engine/active-positions")
+async def engine_active_positions():
+    """Active auto-managed positions with SL/target details."""
+    return {
+        "positions": nifty_engine.order_mgr.get_active_positions(),
+        "count": len([p for p in nifty_engine.order_mgr.positions.values() if p.status != "CLOSED"]),
+    }
+
+
+@app.get("/api/engine/order-log")
+async def engine_order_log():
+    """Full audit trail of all auto-placed orders."""
+    return {
+        "orders": nifty_engine.order_mgr.get_order_log(),
+        "count": len(nifty_engine.order_mgr.order_log),
+    }
+
+
+@app.get("/api/engine/auto-trade-mode")
+async def get_auto_trade_mode():
+    """Get current auto-trading mode."""
+    return {
+        "mode": nifty_engine.auto_trade_mode,
+        "enabled": settings.auto_trade_enabled,
+    }
+
+
+class AutoTradeModeRequest(BaseModel):
+    mode: str  # 'off', 'paper', 'live'
+
+
+@app.post("/api/engine/auto-trade-mode")
+async def set_auto_trade_mode(req: AutoTradeModeRequest):
+    """Switch between off/paper/live auto-trading."""
+    if req.mode not in ("off", "paper", "live"):
+        raise HTTPException(status_code=400, detail="Mode must be 'off', 'paper', or 'live'")
+    nifty_engine.auto_trade_mode = req.mode
+    return {"success": True, "mode": req.mode}
+
+
+@app.post("/api/engine/force-exit/{trade_id}")
+async def force_exit_position(trade_id: str, reason: str = "MANUAL"):
+    """Force exit a specific position."""
+    kite = _require_connection()
+    success = nifty_engine.order_mgr.full_exit(kite, trade_id, reason=reason)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Position {trade_id} not found or already closed")
+    return {"success": True, "trade_id": trade_id, "reason": reason}
 
 
 # ============================================================
@@ -582,6 +724,213 @@ async def telegram_daily_summary():
         nifty_engine.risk_mgr.get_trades_summary(),
     )
     return {"success": True}
+
+
+# ============================================================
+# EOD Trade Journal / Report
+# ============================================================
+
+@app.get("/api/engine/eod-report")
+async def engine_eod_report():
+    """Get comprehensive EOD trade journal report data."""
+    risk_status = nifty_engine.risk_mgr.get_status()
+    return trade_journal.generate_eod_report(risk_status)
+
+
+@app.get("/api/engine/journal")
+async def engine_journal():
+    """Get raw trade journal data (signals + candidates)."""
+    return trade_journal.get_journal_data()
+
+
+@app.post("/api/engine/send-eod-report")
+async def send_eod_report():
+    """Manually trigger EOD report to Telegram."""
+    risk_status = nifty_engine.risk_mgr.get_status()
+    messages = trade_journal.generate_eod_telegram(risk_status)
+    telegram.alert_eod_journal(messages)
+    return {"success": True, "messages_sent": len(messages)}
+
+
+# ============================================================
+# Phase 2-4: New Feature APIs
+# ============================================================
+
+@app.get("/api/engine/safety-filters")
+async def engine_safety_filters():
+    """Current safety filter status (VIX, confidence, cooldown, gap, IV)."""
+    return {
+        "india_vix": nifty_engine._india_vix,
+        "vix_max_threshold": settings.vix_max_threshold,
+        "vix_reduce_size_threshold": settings.vix_reduce_size_threshold,
+        "min_confidence_threshold": settings.min_confidence_threshold,
+        "cooldown_minutes": settings.reentry_cooldown_minutes,
+        "daily_orders_used": nifty_engine.order_mgr._daily_order_count,
+        "daily_orders_limit": settings.auto_trade_max_orders_per_day,
+        "gap_type": nifty_engine._gap_type,
+        "gap_pct": nifty_engine._gap_pct,
+        "iv_reject_threshold": settings.iv_reject_threshold,
+        "expiry_day_early_exit": settings.expiry_day_early_exit_time,
+        "trend_mode_enabled": settings.enable_trend_mode,
+        "multi_tf_enabled": settings.enable_multi_tf,
+        "st_dir_15m": nifty_engine._st_dir_15m,
+        "st_dir_1h": nifty_engine._st_dir_1h,
+        "ws_connected": nifty_engine._ws_connected,
+    }
+
+
+@app.get("/api/engine/strategies")
+async def engine_strategies():
+    """Available strategies and their enabled/disabled status."""
+    return {
+        "orb_breakout": {"enabled": True, "name": "NIFTY Options ORB"},
+        "trend_mode": {
+            "enabled": settings.enable_trend_mode,
+            "name": "TREND Mode",
+            "min_votes": settings.trend_mode_min_votes,
+        },
+        "vwap_mean_reversion": {
+            "enabled": settings.enable_vwap_strategy,
+            "name": "VWAP Mean Reversion",
+        },
+        "expiry_premium_sell": {
+            "enabled": settings.enable_expiry_sell_strategy,
+            "name": "Expiry Premium Sell",
+        },
+        "instruments": settings.instruments_to_trade.split(","),
+    }
+
+
+@app.get("/api/engine/multi-tf")
+async def engine_multi_tf():
+    """Multi-timeframe indicator status."""
+    return {
+        "enabled": settings.enable_multi_tf,
+        "supertrend_5m": int(nifty_engine._cached_df.iloc[-1].get("st_dir", 0))
+            if nifty_engine._cached_df is not None and "st_dir" in nifty_engine._cached_df.columns
+            else 0,
+        "supertrend_15m": nifty_engine._st_dir_15m,
+        "supertrend_1h": nifty_engine._st_dir_1h,
+        "aligned": (
+            nifty_engine._st_dir_15m != 0
+            and nifty_engine._st_dir_1h != 0
+            and nifty_engine._st_dir_15m == nifty_engine._st_dir_1h
+        ),
+    }
+
+
+@app.post("/api/backtest/run")
+
+
+# ------------------------------------------------------------------
+# Live OI Feed endpoints
+# ------------------------------------------------------------------
+
+@app.get("/api/engine/oi-chain")
+async def engine_oi_chain():
+    """
+    Get live option chain with OI data from WebSocket feed.
+    Returns full chain table, PCR, buildup signals, max pain, etc.
+    """
+    feed = nifty_engine._oi_feed
+    if feed and feed.is_running:
+        return feed.get_dashboard_data()
+    # Fallback to cached OI data from REST API
+    return {
+        "source": "rest_api",
+        "connected": False,
+        "message": "Live OI feed not running. Enable with ENABLE_LIVE_OI_FEED=true",
+        "ce_oi_change_pct": nifty_engine._cached_oi_data.get("ce_oi_change_pct", 0) if nifty_engine._cached_oi_data else 0,
+        "pe_oi_change_pct": nifty_engine._cached_oi_data.get("pe_oi_change_pct", 0) if nifty_engine._cached_oi_data else 0,
+    }
+
+
+@app.get("/api/engine/oi-analysis")
+async def engine_oi_analysis():
+    """
+    Get OI analysis summary (PCR, CE/PE OI change, buildup bias).
+    Uses live WebSocket data when available, falls back to REST-fetched data.
+    """
+    feed = nifty_engine._oi_feed
+    if feed and feed.is_running:
+        analysis = feed.get_oi_analysis()
+        analysis["source"] = "live_websocket"
+        return analysis
+    return {
+        "source": "rest_api",
+        "connected": False,
+        **({k: v for k, v in nifty_engine._cached_oi_data.items()} if nifty_engine._cached_oi_data else {}),
+    }
+
+
+@app.post("/api/engine/oi-feed/start")
+async def start_oi_feed():
+    """Manually start the live OI feed."""
+    kite = KiteClient.get_instance()
+    if not kite.is_connected:
+        raise HTTPException(400, "Kite not connected")
+    if nifty_engine.nifty_spot <= 0:
+        raise HTTPException(400, "NIFTY spot price not available — run a cycle first")
+    try:
+        nifty_engine._start_oi_feed(kite)
+        return {"success": True, "message": "Live OI feed started"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start OI feed: {e}")
+
+
+@app.post("/api/engine/oi-feed/stop")
+async def stop_oi_feed():
+    """Stop the live OI feed."""
+    feed = nifty_engine._oi_feed
+    if feed:
+        feed.stop()
+        nifty_engine._oi_feed_started = False
+        return {"success": True, "message": "Live OI feed stopped"}
+    return {"success": False, "message": "OI feed not running"}
+async def run_backtest(
+    strategy: str = "ORB",
+    days: int = 30,
+    capital: float = 1000000,
+):
+    """Run a historical backtest."""
+    from backtester import BacktestEngine, DataLoader
+
+    loader = DataLoader()
+    df = loader.load_nifty_history(days=days, interval="5minute", source="yfinance")
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail="Failed to load historical data")
+
+    sessions = loader.split_by_session(df)
+    if not sessions:
+        raise HTTPException(status_code=400, detail="No valid sessions in data")
+
+    engine = BacktestEngine(strategy=strategy, capital=capital)
+    results = engine.run(sessions)
+    return results.to_dict()
+
+
+@app.get("/api/database/trades")
+async def db_trades(date_str: Optional[str] = None):
+    """Get trades from database for a date (default: today)."""
+    from database import db
+    from datetime import date as date_type
+    db.init()
+    if date_str:
+        trade_date = date_type.fromisoformat(date_str)
+    else:
+        trade_date = date_type.today()
+    return db.get_trades_for_date(trade_date)
+
+
+@app.get("/api/database/daily-stats")
+async def db_daily_stats(from_date: str = "", to_date: str = ""):
+    """Get daily stats for equity curve display."""
+    from database import db
+    from datetime import date as date_type
+    db.init()
+    fd = date_type.fromisoformat(from_date) if from_date else date_type.today() - timedelta(days=30)
+    td = date_type.fromisoformat(to_date) if to_date else date_type.today()
+    return db.get_daily_stats_range(fd, td)
 
 
 # ============================================================
@@ -685,6 +1034,9 @@ DASHBOARD_HTML = """
            border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
   button:hover { opacity: 0.85; }
   button.danger { background: var(--red); }
+  a.kite-chart-link { color: var(--accent); text-decoration: none; font-weight: 700;
+    cursor: pointer; transition: color 0.15s; }
+  a.kite-chart-link:hover { color: #60a5fa; text-decoration: underline; }
   .news-section { margin-top: 16px; }
   .news-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
   .news-tab { background: var(--card); color: var(--muted); border: 1px solid #2a2d3a;
@@ -746,6 +1098,24 @@ DASHBOARD_HTML = """
     <div class="stat" id="open-pos">0</div>
     <div class="meta" id="trades-count">Trades today: 0</div>
   </div>
+  <div class="card">
+    <h2>OI Analysis</h2>
+    <div style="display:flex;gap:16px;align-items:baseline;">
+      <div><span style="font-size:0.8rem;color:var(--muted)">CE OI:</span> <span class="stat" style="font-size:1.5rem" id="ce-oi-chg">—</span></div>
+      <div><span style="font-size:0.8rem;color:var(--muted)">PE OI:</span> <span class="stat" style="font-size:1.5rem" id="pe-oi-chg">—</span></div>
+    </div>
+    <div class="meta" id="oi-interpretation">OI change % vs previous day (ATM ± 3 strikes)</div>
+  </div>
+  <div class="card">
+    <h2>Safety Filters</h2>
+    <div style="font-size:0.85rem;">
+      <div style="margin-bottom:4px;">VIX: <b id="sf-vix">—</b> <span id="sf-vix-status" class="badge badge-green">OK</span></div>
+      <div style="margin-bottom:4px;">Gap: <b id="sf-gap">NONE</b></div>
+      <div style="margin-bottom:4px;">Multi-TF: 15m=<b id="sf-st15m">—</b> 1h=<b id="sf-st1h">—</b></div>
+      <div style="margin-bottom:4px;">Strategies: <span id="sf-strategies">ORB</span></div>
+    </div>
+    <div class="meta">Orders: <span id="sf-orders">0</span>/<span id="sf-orders-max">10</span></div>
+  </div>
 </div>
 
 <!-- Row 2: Signal + Top Scores -->
@@ -761,7 +1131,7 @@ DASHBOARD_HTML = """
     <h2>Top Scored Candidates (Top 10%)</h2>
     <table>
       <thead>
-        <tr><th>Symbol</th><th>Strike</th><th>Type</th><th>Delta</th><th>Score</th><th>LTP</th><th>Volume</th></tr>
+        <tr><th>Option 📈</th><th>Type</th><th>Entry</th><th>SL</th><th>TGT 1</th><th>TGT 2</th><th>TGT 3</th><th>R:R%</th><th>Score</th><th>OI Chg%</th><th>OI Signal</th><th>Expiry</th></tr>
       </thead>
       <tbody id="scores-body"></tbody>
     </table>
@@ -778,6 +1148,72 @@ DASHBOARD_HTML = """
     </thead>
     <tbody id="trades-body"></tbody>
   </table>
+</div>
+
+<!-- Row 3.2: Active Auto-Managed Positions with Trailing SL -->
+<div class="card" style="margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2>🎯 Active Positions – Trailing SL</h2>
+    <button onclick="loadActivePositions()" style="font-size:0.75rem;padding:4px 10px;">⟳ Refresh</button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Type</th><th>Entry</th><th>Qty</th>
+        <th>Init SL</th><th>Trailing SL</th><th>Phase</th><th>Watermark</th>
+        <th>T1</th><th>T2</th><th>T3</th>
+        <th>Targets Hit</th><th>Last TSL Update</th>
+      </tr>
+    </thead>
+    <tbody id="auto-pos-body"></tbody>
+  </table>
+  <div class="meta" id="auto-pos-meta" style="margin-top:6px;">Click "Refresh" or positions update automatically.</div>
+</div>
+
+<!-- Row 3.5: EOD Trade Journal -->
+<div class="card" id="eod-section" style="margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <h2>📋 EOD Trade Journal</h2>
+    <div style="display:flex;gap:8px;">
+      <button onclick="fetchEODReport()" style="font-size:0.75rem;padding:4px 10px;">📊 Load Report</button>
+      <button onclick="sendEODTelegram()" style="font-size:0.75rem;padding:4px 10px;background:var(--green);">📲 Send to Telegram</button>
+    </div>
+  </div>
+  <div id="eod-summary" style="display:none;margin-top:10px;">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:12px;">
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Signals</div><div class="stat" style="font-size:1.4rem;" id="eod-signals">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Candidates</div><div class="stat" style="font-size:1.4rem;" id="eod-candidates">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Activated</div><div class="stat" style="font-size:1.4rem;" id="eod-activated">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Win Rate</div><div class="stat" style="font-size:1.4rem;" id="eod-winrate">—</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Net P&L</div><div class="stat" style="font-size:1.4rem;" id="eod-pnl">₹0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Avg Duration</div><div class="stat" style="font-size:1.4rem;" id="eod-duration">—</div>
+      </div>
+    </div>
+
+    <h3 style="font-size:0.9rem;color:var(--muted);margin:12px 0 6px;">Trade Details</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Call</th><th>Symbol</th><th>Type</th><th>Signal Entry</th>
+          <th>Activated?</th><th>Actual Entry</th><th>Exit</th>
+          <th>P&L</th><th>Duration</th><th>Reason</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody id="eod-trades-body"></tbody>
+    </table>
+  </div>
+  <div id="eod-empty" class="meta" style="margin-top:8px;">Click "Load Report" to view today's trade journal.</div>
 </div>
 
 <!-- Row 4: News Section -->
@@ -876,6 +1312,52 @@ function updateDashboard(d) {
   document.getElementById('trades-count').textContent =
     `Trades today: ${risk.total_trades_today||0} | Halted: ${risk.trading_halted?'YES':'NO'}`;
 
+  // OI Analysis
+  const oi = d.oi_analysis || {};
+  const ceOiEl = document.getElementById('ce-oi-chg');
+  const peOiEl = document.getElementById('pe-oi-chg');
+  const ceChg = oi.ce_oi_change_pct || 0;
+  const peChg = oi.pe_oi_change_pct || 0;
+  ceOiEl.textContent = ceChg !== 0 ? (ceChg > 0 ? '+' : '') + ceChg.toFixed(1) + '%' : '—';
+  ceOiEl.style.color = ceChg > 0 ? 'var(--red)' : ceChg < 0 ? 'var(--green)' : 'var(--muted)';
+  peOiEl.textContent = peChg !== 0 ? (peChg > 0 ? '+' : '') + peChg.toFixed(1) + '%' : '—';
+  peOiEl.style.color = peChg > 0 ? 'var(--red)' : peChg < 0 ? 'var(--green)' : 'var(--muted)';
+  // Interpretation
+  const oiInterpEl = document.getElementById('oi-interpretation');
+  if (ceChg !== 0 || peChg !== 0) {
+    let mood = '';
+    if (ceChg < -2 && peChg > 2) mood = '🟢 Bullish OI (CE unwinding + PE writing)';
+    else if (ceChg > 2 && peChg < -2) mood = '🔴 Bearish OI (CE writing + PE unwinding)';
+    else if (ceChg > 5) mood = '🔴 Heavy CE writing (bearish)';
+    else if (peChg > 5) mood = '🔴 Heavy PE buildup (bearish)';
+    else if (ceChg < -5) mood = '🟢 CE short covering (bullish)';
+    else if (peChg < -5) mood = '🟢 PE unwinding (bullish)';
+    else mood = '🟡 Mixed OI signals';
+    oiInterpEl.textContent = mood;
+  }
+
+  // Safety Filters
+  const sf = d.safety_filters || {};
+  const vixVal = d.india_vix || sf.india_vix || 0;
+  document.getElementById('sf-vix').textContent = vixVal ? vixVal.toFixed(1) : '—';
+  const vixSt = document.getElementById('sf-vix-status');
+  if (vixVal > 20) { vixSt.textContent='HIGH'; vixSt.className='badge badge-red'; }
+  else if (vixVal > 15) { vixSt.textContent='WARN'; vixSt.className='badge badge-yellow'; }
+  else { vixSt.textContent='OK'; vixSt.className='badge badge-green'; }
+  const gapType = sf.gap_type || d.gap_type || 'NONE';
+  const gapPct = sf.gap_pct || d.gap_pct || 0;
+  document.getElementById('sf-gap').textContent = gapType + (gapPct ? ' (' + gapPct.toFixed(2) + '%)' : '');
+  document.getElementById('sf-st15m').textContent = sf.st_dir_15m === 1 ? '▲' : sf.st_dir_15m === -1 ? '▼' : '—';
+  document.getElementById('sf-st1h').textContent = sf.st_dir_1h === 1 ? '▲' : sf.st_dir_1h === -1 ? '▼' : '—';
+  const strats = [];
+  strats.push('ORB');
+  if (sf.vwap_enabled) strats.push('VWAP');
+  if (sf.expiry_sell_enabled) strats.push('ExpSell');
+  if (sf.trend_mode_enabled) strats.push('TREND');
+  document.getElementById('sf-strategies').textContent = strats.join(' | ') || 'ORB';
+  document.getElementById('sf-orders').textContent = risk.total_trades_today || 0;
+  document.getElementById('sf-orders-max').textContent = sf.max_orders || 10;
+
   // Signal
   const sig = d.signal;
   const box = document.getElementById('signal-box');
@@ -902,9 +1384,30 @@ function updateDashboard(d) {
   tbody.innerHTML = '';
   tops.forEach(s => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${s.symbol}</td><td>${s.strike}</td><td>${s.type}</td>
-      <td>${s.delta?.toFixed(3)}</td><td><b>${s.score?.toFixed(1)}</b></td>
-      <td>₹${s.ltp?.toFixed(2)}</td><td>${s.volume}</td>`;
+    const name = s.display_name || s.symbol;
+    const cls = s.type === 'CE' ? 'badge-green' : 'badge-red';
+    const oiChg = s.oi_change_pct || 0;
+    const oiCls = oiChg > 0 ? 'color:var(--green)' : oiChg < 0 ? 'color:var(--red)' : '';
+    const oiInterp = s.oi_interpretation || '—';
+    // Build Kite chart URL: https://kite.zerodha.com/chart/ext/tvc/NFO-OPT/{tradingsymbol}/{instrument_token}
+    const kiteChartUrl = s.instrument_token
+      ? `https://kite.zerodha.com/chart/ext/tvc/NFO-OPT/${encodeURIComponent(s.symbol)}/${s.instrument_token}`
+      : null;
+    const nameHtml = kiteChartUrl
+      ? `<a class="kite-chart-link" href="${kiteChartUrl}" target="_blank" title="Open premium chart on Kite">${name}</a>`
+      : `<b>${name}</b>`;
+    tr.innerHTML = `<td>${nameHtml}</td>
+      <td><span class="badge ${cls}">${s.type}</span></td>
+      <td><b>₹${(s.entry||s.ltp)?.toFixed(0)}</b></td>
+      <td>₹${(s.stoploss||0)?.toFixed(0)}</td>
+      <td>₹${(s.target1||0)?.toFixed(0)}</td>
+      <td>₹${(s.target2||0)?.toFixed(0)}</td>
+      <td>₹${(s.target3||0)?.toFixed(0)}+</td>
+      <td><b>${(s.risk_reward_pct||0)?.toFixed(1)}%</b></td>
+      <td><b>${s.score?.toFixed(1)}</b></td>
+      <td style="${oiCls}">${oiChg > 0 ? '+' : ''}${oiChg.toFixed(1)}%</td>
+      <td class="meta">${oiInterp}</td>
+      <td>${s.expiry||''}</td>`;
     tbody.appendChild(tr);
   });
   document.getElementById('score-meta').textContent =
@@ -930,12 +1433,114 @@ function squareOff() {
   if (confirm('Square off ALL open positions?'))
     fetch('/api/engine/square-off', {method:'POST'}).then(r=>r.json()).then(d=>alert(d.message));
 }
+
+// ── Active Positions with Trailing SL ──
+function loadActivePositions() {
+  fetch('/api/engine/active-positions').then(r=>r.json()).then(data=>{
+    const positions = data.positions || [];
+    const tbody = document.getElementById('auto-pos-body');
+    tbody.innerHTML = '';
+    positions.forEach(p => {
+      const tr = document.createElement('tr');
+      const typeCls = p.option_type === 'CE' ? 'badge-green' : 'badge-red';
+      const phaseCls = p.trailing_phase === 'TIGHT' ? 'badge-green'
+        : p.trailing_phase === 'TRAIL_T2' ? 'badge-green'
+        : p.trailing_phase === 'TRAIL_T1' ? 'badge-blue'
+        : p.trailing_phase === 'BREAKEVEN' ? 'badge-yellow'
+        : 'badge-red';
+      const tslImproved = p.trailing_sl > p.sl;
+      const tslStyle = tslImproved ? 'color:var(--green);font-weight:700' : '';
+      const targets = [];
+      if (p.t1_hit) targets.push('T1✓');
+      if (p.t2_hit) targets.push('T2✓');
+      if (p.t3_hit) targets.push('T3✓');
+      const targetsStr = targets.length ? targets.join(' ') : '—';
+      const lastUpdate = p.last_tsl_update || '—';
+      tr.innerHTML = `
+        <td><b>${p.symbol?.split(':').pop() || p.symbol}</b></td>
+        <td><span class="badge ${typeCls}">${p.option_type}</span></td>
+        <td>₹${(p.entry||0).toFixed(1)}</td>
+        <td>${p.remaining_qty}/${p.qty}</td>
+        <td>₹${(p.sl||0).toFixed(1)}</td>
+        <td style="${tslStyle}">₹${(p.trailing_sl||0).toFixed(1)}</td>
+        <td><span class="badge ${phaseCls}">${p.trailing_phase||'INITIAL'}</span></td>
+        <td>₹${(p.highest_price||0).toFixed(1)}</td>
+        <td>₹${(p.t1||0).toFixed(0)}</td>
+        <td>₹${(p.t2||0).toFixed(0)}</td>
+        <td>₹${(p.t3||0).toFixed(0)}</td>
+        <td>${targetsStr}</td>
+        <td class="meta">${lastUpdate}</td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById('auto-pos-meta').textContent =
+      `${positions.length} active position(s) | Auto-refreshes every cycle`;
+  }).catch(()=>{
+    document.getElementById('auto-pos-meta').textContent = 'Failed to load positions';
+  });
+}
+// Auto-refresh active positions every 30 seconds
+setInterval(loadActivePositions, 30000);
+// Load once on page load
+setTimeout(loadActivePositions, 2000);
 function fetchOfflineData() {
   document.getElementById('offline-btn').textContent = 'Loading…';
   fetch('/api/engine/offline-data').then(r=>r.json()).then(d=>{
     updateDashboard(d);
     document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data';
   }).catch(()=>{ document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data'; });
+}
+
+// ── EOD Trade Journal functions ──
+function fetchEODReport() {
+  document.getElementById('eod-empty').textContent = 'Loading…';
+  fetch('/api/engine/eod-report').then(r=>r.json()).then(data=>{
+    const s = data.summary || {};
+    document.getElementById('eod-signals').textContent = s.total_signals || 0;
+    document.getElementById('eod-candidates').textContent = s.total_candidates || 0;
+    document.getElementById('eod-activated').textContent = s.activated_count || 0;
+    document.getElementById('eod-winrate').textContent = (s.win_rate||0).toFixed(0) + '%';
+    const pnl = s.total_pnl || 0;
+    const pnlEl = document.getElementById('eod-pnl');
+    pnlEl.textContent = '₹' + pnl.toFixed(0);
+    pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    document.getElementById('eod-duration').textContent = s.avg_duration || '—';
+
+    // Populate trade details table
+    const tbody = document.getElementById('eod-trades-body');
+    tbody.innerHTML = '';
+    (data.trades || []).forEach((t, i) => {
+      const tr = document.createElement('tr');
+      const activated = t.activated;
+      const pnlVal = t.pnl || 0;
+      const pnlCls = pnlVal >= 0 ? 'green' : 'red';
+      const activatedBadge = activated
+        ? '<span class="badge badge-green">YES</span>'
+        : '<span class="badge badge-yellow">NO</span>';
+      tr.innerHTML = `<td>${i+1}</td>
+        <td><b>${t.display_name||t.symbol}</b></td>
+        <td><span class="badge ${t.option_type==='CE'?'badge-green':'badge-red'}">${t.option_type}</span></td>
+        <td>₹${(t.suggested_entry||0).toFixed(0)}</td>
+        <td>${activatedBadge}</td>
+        <td>${activated?'₹'+(t.actual_entry||0).toFixed(2):'—'}</td>
+        <td>${activated&&t.actual_exit?'₹'+t.actual_exit.toFixed(2):'—'}</td>
+        <td style="color:var(--${pnlCls});font-weight:700">${activated?'₹'+pnlVal.toFixed(2):'—'}</td>
+        <td>${t.duration||'—'}</td>
+        <td>${t.exit_reason||t.status||'—'}</td>
+        <td>${(t.score||0).toFixed(0)}</td>`;
+      tbody.appendChild(tr);
+    });
+
+    document.getElementById('eod-summary').style.display = 'block';
+    document.getElementById('eod-empty').style.display = 'none';
+  }).catch(e=>{
+    document.getElementById('eod-empty').textContent = 'Failed to load report.';
+  });
+}
+
+function sendEODTelegram() {
+  fetch('/api/engine/send-eod-report', {method:'POST'}).then(r=>r.json()).then(d=>{
+    alert('EOD report sent to Telegram! (' + (d.messages_sent||0) + ' messages)');
+  }).catch(()=>alert('Failed to send EOD report.'));
 }
 
 // ── News functions ──

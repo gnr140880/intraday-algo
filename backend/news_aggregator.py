@@ -36,6 +36,9 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Indian Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
 # ── RSS Feed Sources ──────────────────────────────────────────
 
 INDIA_RSS_FEEDS = {
@@ -190,7 +193,7 @@ def _parse_feed(source_name: str, url: str, max_items: int = 15) -> List[NewsIte
     items = []
     try:
         feed = feedparser.parse(url)
-        today = date.today()
+        today_ist = datetime.now(IST).date()
         for entry in feed.entries[:max_items]:
             # Parse date
             published_str = ""
@@ -205,8 +208,8 @@ def _parse_feed(source_name: str, url: str, max_items: int = 15) -> List[NewsIte
                 published_str = datetime.now(timezone.utc).isoformat()
                 pub_date = datetime.now(timezone.utc)
 
-            # Filter to today (or last 24h)
-            if pub_date and (datetime.now(timezone.utc) - pub_date) > timedelta(hours=36):
+            # Filter to today's date in IST only
+            if pub_date and pub_date.astimezone(IST).date() != today_ist:
                 continue
 
             title = entry.get("title", "").strip()
@@ -250,7 +253,7 @@ def _fetch_newsapi(query: str, category_hint: str, max_items: int = 10) -> List[
         return []
     items = []
     try:
-        today_str = date.today().isoformat()
+        today_str = datetime.now(IST).date().isoformat()
         url = "https://newsapi.org/v2/everything"
         params = {
             "q": query,

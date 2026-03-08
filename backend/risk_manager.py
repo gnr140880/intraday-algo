@@ -115,11 +115,11 @@ class RiskManager:
     # Position sizing
     # ------------------------------------------------------------------
     def calculate_quantity(
-        self, entry_price: float, stop_loss: float, lot_size: int = 25
+        self, entry_price: float, stop_loss: float, lot_size: int = 75
     ) -> int:
         """
         Calculate quantity based on max risk per trade and lot size.
-        NIFTY lot size = 25 (as of 2026).
+        NIFTY lot size = 75 (as of 2025). Caller should pass settings.nifty_lot_size.
         """
         risk_per_unit = abs(entry_price - stop_loss)
         if risk_per_unit <= 0:
@@ -175,10 +175,9 @@ class RiskManager:
         if trade is None:
             return None
 
-        if trade.option_type == "CE":
-            trade.pnl = (exit_price - trade.entry_price) * trade.quantity
-        else:
-            trade.pnl = (trade.entry_price - exit_price) * trade.quantity
+        # Both CE and PE are BOUGHT (long options):
+        # P&L = (exit_price - entry_price) * quantity
+        trade.pnl = (exit_price - trade.entry_price) * trade.quantity
 
         trade.exit_price = exit_price
         trade.exit_time = datetime.now().isoformat()
@@ -204,10 +203,8 @@ class RiskManager:
         for tid, ltp in positions.items():
             trade = self.open_positions.get(tid)
             if trade:
-                if trade.option_type == "CE":
-                    unrealised += (ltp - trade.entry_price) * trade.quantity
-                else:
-                    unrealised += (trade.entry_price - ltp) * trade.quantity
+                # Both CE and PE are BOUGHT (long options)
+                unrealised += (ltp - trade.entry_price) * trade.quantity
         self.unrealised_pnl = unrealised
         self.daily_pnl = self.realised_pnl + self.unrealised_pnl
 
@@ -219,35 +216,29 @@ class RiskManager:
     # Trailing stop-loss update
     # ------------------------------------------------------------------
     def update_trailing_sl(self, trade_id: str, current_price: float, atr: float):
+        """Legacy trailing SL update (use TrailingSLManager for the new system).
+        For BOUGHT options (both CE & PE), trail upward only."""
         trade = self.open_positions.get(trade_id)
         if trade is None:
             return
 
-        if trade.option_type == "CE":
-            new_sl = current_price - atr * 1.5
-            if new_sl > trade.trailing_sl:
-                trade.trailing_sl = round(new_sl, 2)
-        else:
-            new_sl = current_price + atr * 1.5
-            if new_sl < trade.trailing_sl:
-                trade.trailing_sl = round(new_sl, 2)
+        # Both CE and PE are bought → trail SL upward as premium rises
+        new_sl = current_price - atr * 1.5
+        if new_sl > trade.trailing_sl:
+            trade.trailing_sl = round(new_sl, 2)
 
     def check_sl_target(self, trade_id: str, current_price: float) -> Optional[str]:
-        """Check if SL or target hit. Returns action or None."""
+        """Check if SL or target hit. Returns action or None.
+        For BOUGHT options: SL hit when price drops, target hit when price rises."""
         trade = self.open_positions.get(trade_id)
         if trade is None:
             return None
 
-        if trade.option_type == "CE":
-            if current_price <= trade.trailing_sl:
-                return "SL_HIT"
-            if current_price >= trade.target:
-                return "TARGET_HIT"
-        else:
-            if current_price >= trade.trailing_sl:
-                return "SL_HIT"
-            if current_price <= trade.target:
-                return "TARGET_HIT"
+        # Both CE and PE are bought → SL when premium drops, target when premium rises
+        if current_price <= trade.trailing_sl:
+            return "SL_HIT"
+        if current_price >= trade.target:
+            return "TARGET_HIT"
         return None
 
     # ------------------------------------------------------------------
