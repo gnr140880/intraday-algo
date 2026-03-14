@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, date, time
 """
 NIFTY Options Engine – Orchestrator
 
@@ -51,7 +52,7 @@ INSTRUMENT_CONFIG = {
         "nfo_name": "NIFTY",
         "lot_size_setting": "nifty_lot_size",
         "strike_gap": 50,
-        "default_lot_size": 75,
+        "default_lot_size": 65,
     },
     "BANKNIFTY": {
         "name": "BANKNIFTY",
@@ -66,7 +67,7 @@ INSTRUMENT_CONFIG = {
 # Legacy constants (kept for backward compat)
 NIFTY_STRIKE_GAP = 50
 NIFTY_INSTRUMENT = "NSE:NIFTY 50"
-
+NIFTY_TOKEN = 256265
 
 class NiftyOptionsEngine:
     """
@@ -140,7 +141,107 @@ class NiftyOptionsEngine:
         self.last_signal = None
         self.scored_candidates: List[OptionCandidate] = []
         self.all_candidates: List[OptionCandidate] = []
-        self.nifty_token: Optional[int] = None
+        self.nifty_token: Optional[int] = NIFTY_TOKEN
+        self.nifty_spot_symbol: Optional[str] = None
+        self._orb_captured: bool = False
+        self._cached_levels: Optional[IntraDayLevels] = None
+        self._today: Optional[date] = None
+        self.dashboard_state: Dict = {
+            "engine_status": "IDLE",
+            "orb": {"high": None, "low": None, "captured": False},
+            "signal": None,
+            "top_candidates": [],
+            "risk": {},
+            "trades": [],
+            "levels": {},
+            "auto_trade_mode": self.auto_trade_mode,
+            "active_positions": [],
+            "order_log": [],
+            "oi_analysis": {"ce_oi_change_pct": 0, "pe_oi_change_pct": 0},
+            "last_update": None,
+        }
+        self._nfo_instruments = []
+        self._option_index = {}
+        self._strike_ladder = {}
+        self._load_nfo_instruments()
+        self._build_option_index()
+        self._init_nifty_spot_token()
+    def _build_option_index(self):
+        """Build option index for O(1) lookup and strike ladder."""
+        option_index = {}
+        strike_ladder = {}
+        for row in self._nfo_instruments:
+            key = (
+                row["name"],
+                str(row["expiry"]),
+                int(row["strike"]),
+                row["instrument_type"]
+            )
+            option_index[key] = row
+            # Build strike ladder
+            ladder_key = (row["name"], str(row["expiry"]))
+            strike_ladder.setdefault(ladder_key, set()).add(int(row["strike"]))
+        # Convert sets to sorted lists
+        for k in strike_ladder:
+            strike_ladder[k] = sorted(list(strike_ladder[k]))
+        self._option_index = option_index
+        self._strike_ladder = strike_ladder
+        logger.info(f"Option index built: {len(option_index)} keys, {len(strike_ladder)} ladders")
+
+    @staticmethod
+    def get_atm_strike(spot, strike_gap=50):
+        """Get ATM strike rounded to nearest strike gap."""
+        return round(spot / strike_gap) * strike_gap
+
+    def get_option(self, symbol, expiry, strike, option_type):
+        """O(1) lookup for option instrument."""
+        key = (symbol, str(expiry), int(strike), option_type)
+        return self._option_index.get(key)
+
+    def get_strike_ladder(self, symbol, expiry):
+        """Get sorted list of strikes for symbol/expiry."""
+        return self._strike_ladder.get((symbol, str(expiry)), [])
+
+    def _load_nfo_instruments(self):
+        """Load NFO instruments from instruments.csv and cache as list of dicts."""
+        import csv
+        from pathlib import Path
+        csv_path = Path(__file__).resolve().parent / "instruments.csv"
+        instruments = []
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Only cache NFO options
+                    if row.get("segment") == "NFO-OPT":
+                        # Convert fields as needed
+                        try:
+                            row["strike"] = float(row.get("strike", 0))
+                        except Exception:
+                            row["strike"] = 0.0
+                        row["expiry"] = row.get("expiry")
+                        instruments.append(row)
+            self._nfo_instruments = instruments
+            logger.info(f"Loaded {len(instruments)} NFO option instruments from CSV")
+        except Exception as e:
+            self._nfo_instruments = []
+            logger.error(f"Failed to load NFO instruments from CSV: {e}")
+    def _init_nifty_spot_token(self):
+        """
+        Fetch and set the correct NIFTY spot instrument token and symbol from Zerodha instruments.
+        """
+        try:
+            kite = KiteClient.get_instance()
+            instruments = kite.get_instruments("NSE")
+            for inst in instruments:
+                if inst.get("name") == "NIFTY 50" or inst.get("tradingsymbol") == "NIFTY 50" or inst.get("name") == "NIFTY":
+                    self.nifty_token = inst["instrument_token"]
+                    self.nifty_spot_symbol = inst["tradingsymbol"]
+                    logger.info(f"NIFTY spot instrument resolved: token={self.nifty_token}, symbol={self.nifty_spot_symbol}")
+                    return
+            logger.warning("NIFTY spot instrument not found in Zerodha instruments.")
+        except Exception as e:
+            logger.error(f"Failed to resolve NIFTY spot instrument: {e}")
         self._orb_captured = False
         self._today: Optional[date] = None
         self._cycle_count = 0
@@ -288,6 +389,9 @@ class NiftyOptionsEngine:
                 c.ask = live["ask"] if live["ask"] > 0 else round(live["ltp"] * 1.005, 2)
                 c.price_source = "live"
                 c.oi_interpretation = live["buildup"]
+                # IV spike filter
+                if hasattr(c, "iv_percentile") and c.iv_percentile > 85:
+                    c.skip_buy = True
                 updated += 1
 
         if updated > 0:
@@ -424,6 +528,13 @@ class NiftyOptionsEngine:
         tte_days: time to expiry in calendar days
         iv: implied vol as decimal (e.g. 0.15 for 15%)
         """
+        try:
+            from scipy.stats import norm
+        except ImportError:
+            class norm:
+                @staticmethod
+                def cdf(x):
+                    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
         if tte_days <= 0 or iv <= 0:
             # ITM → ~1, OTM → ~0
             if option_type == "CE":
@@ -431,7 +542,6 @@ class NiftyOptionsEngine:
             else:
                 return -1.0 if spot < strike else 0.0
 
-        from scipy.stats import norm
         T = tte_days / 365
         r = 0.06  # risk-free rate approx
         d1 = (math.log(spot / strike) + (r + iv ** 2 / 2) * T) / (iv * math.sqrt(T))
@@ -701,11 +811,29 @@ class NiftyOptionsEngine:
         inst_cfg = INSTRUMENT_CONFIG.get(instrument_name, INSTRUMENT_CONFIG["NIFTY"])
         strike_gap = inst_cfg["strike_gap"]
         nfo_name = inst_cfg["nfo_name"]
-        try:
-            nfo_instruments = kite.get_instruments("NFO")
-        except Exception as e:
-            logger.error(f"Failed to fetch NFO instruments: {e}")
-            return candidates
+        # Use API for live/paper trading, CSV for offline/backtest
+        # Use API for live/paper trading, CSV for offline/backtest
+        nfo_instruments = []
+        if self.auto_trade_mode in ("live", "paper"):
+            try:
+                kite_instruments = kite.get_instruments("NFO")
+                nfo_instruments = [row for row in kite_instruments if row.get("segment") == "NFO-OPT"]
+                logger.info(f"Loaded {len(nfo_instruments)} NFO option instruments from API")
+                self._nfo_instruments = nfo_instruments
+                self._build_option_index()
+            except Exception as e:
+                logger.error(f"Failed to load NFO instruments from API: {e}")
+                nfo_instruments = self._nfo_instruments if hasattr(self, '_nfo_instruments') else []
+        else:
+            nfo_instruments = self._nfo_instruments if hasattr(self, '_nfo_instruments') else []
+            if not nfo_instruments:
+                logger.error("NFO instruments not cached.")
+                return []
+        # Option index is now built and available
+        # Example usage: O(1) ATM lookup
+        # These lines should be inside the function body, not at top-level
+        # ATM strike and option lookup
+        # (If you want to use these, place them after nearest_expiry is defined)
 
         # Current expiry: nearest weekly
         today = date.today()
@@ -813,7 +941,8 @@ class NiftyOptionsEngine:
                 continue
 
             # Volume spike: compare to 20-bar option volume (simple: use daily volume > 5000)
-            vol_spike = volume > 5000  # simplified threshold
+            avg_volume = np.mean([i.get("volume", 0) for i in relevant]) if relevant else 0
+            vol_spike = volume > avg_volume * 2 if avg_volume > 0 else volume > 5000
 
             # OI change % for this specific strike
             strike_oi_info = strike_oi.get((inst["strike"], primary_type), {})
@@ -991,12 +1120,32 @@ class NiftyOptionsEngine:
         Fetch NIFTY spot LTP + last session's option chain scored candidates
         even when the market is closed. Updates dashboard_state and returns it.
         """
+        # Auto-select exact option contract for signal
+        top_option = None
+        if self.scored_candidates:
+            # Pick top scored candidate
+            top_option = self.scored_candidates[0]
+            self.dashboard_state["auto_selected_option"] = {
+                "tradingsymbol": top_option.tradingsymbol,
+                "instrument_token": top_option.instrument_token,
+                "strike": top_option.strike,
+                "option_type": top_option.option_type,
+                "expiry": top_option.expiry,
+                "ltp": top_option.ltp,
+                "delta": top_option.delta,
+                "confidence": getattr(top_option, "score", None),
+            }
+        else:
+            self.dashboard_state["auto_selected_option"] = None
+        # Diagnostic error messages
+        dashboard_errors = []
         kite = KiteClient.get_instance()
 
-        # 1. Get NIFTY spot — try Kite LTP, fallback to yfinance
+        # 1. Get NIFTY spot — use NIFTY_INSTRUMENT constant for Kite LTP, fallback to yfinance
         spot = 0.0
         try:
             ltp_data = kite.get_ltp([NIFTY_INSTRUMENT])
+            logger.info(f"Kite LTP response for NIFTY_INSTRUMENT {NIFTY_INSTRUMENT}: {ltp_data}")
             spot = ltp_data.get(NIFTY_INSTRUMENT, {}).get("last_price", 0)
         except Exception as e:
             logger.info(f"Offline: Kite LTP unavailable ({type(e).__name__}), trying yfinance…")
@@ -1008,6 +1157,8 @@ class NiftyOptionsEngine:
 
         if spot > 0:
             self.nifty_spot = spot
+        else:
+            dashboard_errors.append("NIFTY spot not available. Check API session or market status.")
 
         # 2. Fetch historical data — try Kite, fallback to yfinance
         df = None
@@ -1020,6 +1171,8 @@ class NiftyOptionsEngine:
             df = fetch_nifty_history_yf(days=5, interval="5m")
             if df is not None and not df.empty:
                 logger.info(f"Offline: using yfinance history ({len(df)} candles)")
+            else:
+                dashboard_errors.append("Historical spot data not available.")
 
         # 3. Compute ORB + indicators from historical data
         st_dir = 1
@@ -1063,7 +1216,8 @@ class NiftyOptionsEngine:
                         kite, self.nifty_spot, signal_dir, df
                     )
             except Exception as e:
-                logger.info(f"Offline: Kite candidate build failed ({type(e).__name__}), using fallback")
+                logger.info(f"Offline: Kite candidate build failed ({type(e).__name__}): {e}")
+                dashboard_errors.append(f"Candidate build failed: {type(e).__name__}: {e}")
                 self.all_candidates = []
 
             # If Kite quotes failed (PermissionException), use B-S fallback
@@ -1079,6 +1233,8 @@ class NiftyOptionsEngine:
                     macd_hist_prev=macd_hist_prev,
                     atr_val=atr_val,
                 )
+                if not self.all_candidates:
+                    dashboard_errors.append("No option candidates found. Check instrument master and spot data.")
 
             if self.all_candidates:
                 self.scored_candidates = self.scorer.rank_candidates(
@@ -1102,19 +1258,28 @@ class NiftyOptionsEngine:
         self.dashboard_state["all_candidates_count"] = len(self.all_candidates)
         self.dashboard_state["risk"] = self.risk_mgr.get_status()
         self.dashboard_state["trades"] = self.risk_mgr.get_trades_summary()
+        # Ensure _cycle_count is initialized
+        if not hasattr(self, "_cycle_count"):
+            self._cycle_count = 0
         self.dashboard_state["cycle_count"] = self._cycle_count
         # OI analysis — use live WebSocket data if available
         if self._oi_feed and self._oi_feed.is_running:
             self.dashboard_state["oi_analysis"] = self._oi_feed.get_dashboard_data()
         else:
+            # Ensure _cached_oi_data is initialized
+            if not hasattr(self, "_cached_oi_data") or self._cached_oi_data is None:
+                self._cached_oi_data = {}
             self.dashboard_state["oi_analysis"] = {
                 "source": "rest_api",
                 "connected": False,
-                "ce_oi_change_pct": self._cached_oi_data.get("ce_oi_change_pct", 0) if self._cached_oi_data else 0,
-                "pe_oi_change_pct": self._cached_oi_data.get("pe_oi_change_pct", 0) if self._cached_oi_data else 0,
-                "pcr": self._cached_oi_data.get("pcr", 0) if self._cached_oi_data else 0,
+                "ce_oi_change_pct": self._cached_oi_data.get("ce_oi_change_pct", 0),
+                "pe_oi_change_pct": self._cached_oi_data.get("pe_oi_change_pct", 0),
+                "pcr": self._cached_oi_data.get("pcr", 0),
             }
+            if self._cached_oi_data.get("ce_oi_change_pct", 0) == 0 and self._cached_oi_data.get("pe_oi_change_pct", 0) == 0:
+                dashboard_errors.append("OI analysis not available. Check option chain and API session.")
         self.dashboard_state["last_update"] = datetime.now().isoformat()
+        self.dashboard_state["errors"] = dashboard_errors
         return self.dashboard_state
 
     # ------------------------------------------------------------------
@@ -1282,7 +1447,7 @@ class NiftyOptionsEngine:
                         # Record in journal if position is now closed
                         updated_pos = self.order_mgr.positions.get(trade_id)
                         if updated_pos and updated_pos.status == "CLOSED":
-                            pnl = (ltp - pos.entry_price) * pos.quantity
+                            pnl = (ltp - pos.entry_price) * pos.quantity * direction
                             self.journal.close_candidate(
                                 trade_id=trade_id,
                                 exit_price=ltp,

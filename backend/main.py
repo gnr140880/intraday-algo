@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, date, time
 """
 AlgoTest - FastAPI backend for algorithmic trading on Indian markets.
 """
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
 import json
+
 
 from config import settings, NIFTY50_STOCKS, MIDCAP_WATCHLIST, FON_ACTIVES, GLOBAL_INDICES, INDIA_INDICES
 from kite_client import KiteClient
@@ -966,23 +968,30 @@ async def ws_dashboard(websocket: WebSocket):
     await ws_dashboard_manager.connect(websocket)
     # Send initial state
     try:
-        await websocket.send_json(nifty_engine.get_dashboard())
+      await websocket.send_json(nifty_engine.get_dashboard())
     except Exception:
-        pass
+      pass
     try:
-        while True:
-            msg = await websocket.receive_text()
-            try:
-                parsed = json.loads(msg)
-                if parsed.get("action") == "run_cycle":
-                    state = nifty_engine.run_cycle()
-                    await websocket.send_json(state)
-                elif parsed.get("action") == "get_state":
-                    await websocket.send_json(nifty_engine.get_dashboard())
-            except json.JSONDecodeError:
-                await websocket.send_json({"error": "Invalid JSON"})
-    except WebSocketDisconnect:
-        ws_dashboard_manager.disconnect(websocket)
+      while True:
+        try:
+          msg = await websocket.receive_text()
+        except RuntimeError as e:
+          # WebSocket not connected or closed
+          ws_dashboard_manager.disconnect(websocket)
+          break
+        try:
+          parsed = json.loads(msg)
+          if parsed.get("action") == "run_cycle":
+            state = nifty_engine.run_cycle()
+            await websocket.send_json(state)
+          elif parsed.get("action") == "get_state":
+            await websocket.send_json(nifty_engine.get_dashboard())
+        except json.JSONDecodeError:
+          await websocket.send_json({"error": "Invalid JSON"})
+        except Exception:
+          pass
+    except Exception:
+      ws_dashboard_manager.disconnect(websocket)
 
 
 # ============================================================
@@ -1389,9 +1398,9 @@ function updateDashboard(d) {
     const oiChg = s.oi_change_pct || 0;
     const oiCls = oiChg > 0 ? 'color:var(--green)' : oiChg < 0 ? 'color:var(--red)' : '';
     const oiInterp = s.oi_interpretation || '—';
-    // Build Kite chart URL: https://kite.zerodha.com/chart/ext/tvc/NFO-OPT/{tradingsymbol}/{instrument_token}
+    // Build Kite chart URL: https://kite.zerodha.com/markets/ext/chart/web/tvc/NFO-OPT/{tradingsymbol}/{instrument_token}
     const kiteChartUrl = s.instrument_token
-      ? `https://kite.zerodha.com/chart/ext/tvc/NFO-OPT/${encodeURIComponent(s.symbol)}/${s.instrument_token}`
+      ? `https://kite.zerodha.com/markets/ext/chart/web/tvc/NFO-OPT/${encodeURIComponent(s.symbol)}/${s.instrument_token}`
       : null;
     const nameHtml = kiteChartUrl
       ? `<a class="kite-chart-link" href="${kiteChartUrl}" target="_blank" title="Open premium chart on Kite">${name}</a>`

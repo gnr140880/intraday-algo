@@ -23,14 +23,22 @@ Setup:
 """
 import logging
 import httpx
-from typing import Optional, Dict, List
+import requests
+from dotenv import load_dotenv
+import os
+from typing import List, Dict
+
 from datetime import datetime
 
-from config import settings
+load_dotenv()
 
-logger = logging.getLogger(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramAlerter:
@@ -40,8 +48,8 @@ class TelegramAlerter:
     """
 
     def __init__(self):
-        self.token: str = settings.telegram_bot_token
-        self.chat_id: str = settings.telegram_chat_id
+        self.token: str = os.getenv("BOT_TOKEN")
+        self.chat_id: str = os.getenv("CHAT_ID")
         self.enabled: bool = bool(self.token and self.chat_id)
         self._last_sent: Dict[str, float] = {}  # rate limit tracker
         self._min_interval = 5  # min seconds between same alert type
@@ -49,12 +57,12 @@ class TelegramAlerter:
         if self.enabled:
             logger.info("Telegram alerts enabled")
         else:
-            logger.info("Telegram alerts disabled (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID in .env)")
+            logger.info("Telegram alerts disabled (set BOT_TOKEN & CHAT_ID in .env)")
 
     def reload_config(self):
-        """Reload token/chat_id from settings (if updated at runtime)."""
-        self.token = settings.telegram_bot_token
-        self.chat_id = settings.telegram_chat_id
+        """Reload token/chat_id from environment variables (if updated at runtime)."""
+        self.token = os.getenv("BOT_TOKEN")
+        self.chat_id = os.getenv("CHAT_ID")
         self.enabled = bool(self.token and self.chat_id)
 
     def _rate_ok(self, key: str) -> bool:
