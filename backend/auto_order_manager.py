@@ -131,8 +131,7 @@ class AutoOrderManager:
             self._daily_order_date = today_str
         if self._daily_order_count >= settings.auto_trade_max_orders_per_day:
             logger.warning(
-                f"Daily order limit reached ({self._daily_order_count}/"
-                f"{settings.auto_trade_max_orders_per_day}). Skipping trade."
+                f"Trade skipped: daily order limit reached ({self._daily_order_count}/{settings.auto_trade_max_orders_per_day}) for {symbol}"
             )
             return None
 
@@ -142,7 +141,7 @@ class AutoOrderManager:
         risk_amount = abs(smart_levels.entry - smart_levels.option_sl) * quantity
         risk_check = self.risk_mgr.can_take_trade(risk_amount)
         if not risk_check["allowed"]:
-            logger.warning(f"Trade blocked by risk manager: {risk_check['reasons']}")
+            logger.warning(f"Trade skipped: risk manager blocked trade for {symbol} | Reasons: {risk_check['reasons']}")
             return None
 
         # --- Place ENTRY order (MARKET) ---
@@ -157,7 +156,7 @@ class AutoOrderManager:
         )
 
         if not entry_result.get("success"):
-            logger.error(f"Entry order failed for {symbol}: {entry_result}")
+            logger.error(f"Trade skipped: entry order failed for {symbol} | Response: {entry_result}")
             return None
 
         entry_order_id = entry_result.get("order_id", "")
@@ -206,7 +205,7 @@ class AutoOrderManager:
             )
             self.order_log.append(sl_order)
         else:
-            logger.warning(f"SL order failed for {symbol}: {sl_result}. Will manage via polling.")
+            logger.warning(f"Trade skipped: SL order failed for {symbol} | Response: {sl_result}. Will manage via polling.")
 
         # --- Create managed position ---
         entry_px = smart_levels.entry if smart_levels.entry > 0 else 0
@@ -419,6 +418,9 @@ class AutoOrderManager:
 
         # Telegram alert
         pnl = (exit_price - pos.entry_price) * pos.remaining_qty
+        logger.info(
+            f"Sending Telegram EXIT alert for {pos.symbol} | Reason: {reason} | Trade ID: {trade_id} | Exit Price: {exit_price} | Qty: {pos.remaining_qty}"
+        )
         telegram.alert_trade_exit(
             symbol=pos.symbol,
             option_type=pos.option_type,
@@ -460,6 +462,14 @@ class AutoOrderManager:
         if new_tsl and new_tsl > 0 and new_tsl > pos.trailing_sl:
             pos.trailing_sl = new_tsl
             pos.last_tsl_update = datetime.now().isoformat()
+            # Telegram alert for TSL tightening
+            telegram.send_custom(
+                f"🔔 <b>Trailing SL tightened</b>\n"
+                f"Symbol: <b>{pos.symbol}</b> ({pos.option_type})\n"
+                f"New TSL: <b>₹{new_tsl:.2f}</b>\n"
+                f"Phase: {pos.trailing_phase}\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
 
         if exit_pct >= 1.0:
             # Full exit

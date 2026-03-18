@@ -196,6 +196,8 @@ class TradeJournal:
                 logger.info(f"Journal: candidate {c.candidate_id} activated as trade {trade_id}")
                 return
         logger.warning(f"Journal: no unactivated candidate found for {symbol}")
+        logger.warning(f"All candidate symbols: {[c.symbol for c in self.candidates]}")
+        logger.warning(f"All candidate trade_ids: {[c.trade_id for c in self.candidates]}")
 
     # ------------------------------------------------------------------
     # Close a candidate (trade exited)
@@ -221,6 +223,8 @@ class TradeJournal:
                 )
                 return
         logger.warning(f"Journal: no activated candidate found for trade {trade_id}")
+        logger.warning(f"All candidate trade_ids: {[c.trade_id for c in self.candidates]}")
+        logger.warning(f"All candidate symbols: {[c.symbol for c in self.candidates]}")
 
     # ------------------------------------------------------------------
     # Compute duration

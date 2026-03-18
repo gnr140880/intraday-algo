@@ -5,11 +5,11 @@ AlgoTest - FastAPI backend for algorithmic trading on Indian markets.
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
-from datetime import datetime, timedelta
+import threading
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
@@ -18,9 +18,43 @@ import json
 
 from config import settings, NIFTY50_STOCKS, MIDCAP_WATCHLIST, FON_ACTIVES, GLOBAL_INDICES, INDIA_INDICES
 from kite_client import KiteClient
+import io
+import csv as csv_mod
+import pandas as pd
+from pathlib import Path
+
+# --- Well-known index instrument tokens ---
+INDEX_TOKENS = {
+    "NIFTY": 256265,
+    "BANKNIFTY": 260105,
+    "FINNIFTY": 257801,
+    "MIDCPNIFTY": 288009,
+}
+
+# --- Kite historical interval limits (max calendar days allowed) ---
+INTERVAL_MAX_DAYS = {
+    "minute": 60,
+    "3minute": 100,
+    "5minute": 100,
+    "10minute": 100,
+    "15minute": 200,
+    "30minute": 200,
+    "60minute": 400,
+    "hour": 400,
+    "day": 2000,
+}
+VALID_INTERVALS = list(INTERVAL_MAX_DAYS.keys())
 # from auto_login import refresh_access_token, is_token_valid  # auto-login disabled
 from strategies.supertrend_strategy import SupertrendStrategy
 from strategies.nifty_options_orb import NiftyOptionsORBStrategy
+from strategies.vwap_mean_reversion import VWAPMeanReversionStrategy
+from strategies.pcr_oi_directional import PCROIDirectionalStrategy
+from strategies.vwap_breakout import VWAPBreakoutStrategy
+from strategies.ema_crossover import EMACrossoverStrategy
+from strategies.rsi_divergence import RSIDivergenceStrategy
+from strategies.gap_fill import GapFillStrategy
+from strategies.straddle_strangle import StraddleStrangleSellStrategy
+from strategies.iron_condor import IronCondorStrategy
 from options_engine import NiftyOptionsEngine
 from scoring_engine import ScoringEngine
 from risk_manager import RiskManager
@@ -35,29 +69,68 @@ logger = logging.getLogger(__name__)
 STRATEGIES = {
     "supertrend_ema": SupertrendStrategy,
     "nifty_options_orb": NiftyOptionsORBStrategy,
+    "vwap_mean_reversion": VWAPMeanReversionStrategy,
+    "pcr_oi_directional": PCROIDirectionalStrategy,
+    "vwap_breakout": VWAPBreakoutStrategy,
+    "ema_crossover": EMACrossoverStrategy,
+    "rsi_divergence": RSIDivergenceStrategy,
+    "gap_fill": GapFillStrategy,
+    "straddle_strangle": StraddleStrangleSellStrategy,
+    "iron_condor": IronCondorStrategy,
 }
 
 # --- NIFTY Options Engine singleton ---
 nifty_engine = NiftyOptionsEngine()
 scheduler = AsyncIOScheduler()
 
+_ENGINE_CYCLE_LOCK = threading.Lock()
 
-def engine_cycle_job():
-    """Scheduler job: runs engine cycle synchronously."""
+
+def _require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    """
+    Protect trading-capable endpoints.
+    Configure via `.env` as API_KEY="<long-random-string>".
+    """
+    if not settings.api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="API_KEY is not configured on server. Set API_KEY in backend/.env to enable protected endpoints.",
+        )
+
+    presented = x_api_key
+    if not presented and authorization:
+        # Accept: Authorization: Bearer <token>
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            presented = parts[1]
+
+    if presented != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
+
+
+async def _run_cycle_locked() -> dict:
+    """
+    Run one engine cycle with mutual exclusion.
+    Executes in a worker thread to avoid blocking the asyncio loop.
+    """
+    def _do():
+        with _ENGINE_CYCLE_LOCK:
+            return nifty_engine.run_cycle()
+
+    return await asyncio.to_thread(_do)
+
+
+async def engine_cycle_job():
+    """Scheduler job: runs one engine cycle."""
     try:
-        state = nifty_engine.run_cycle()
-        # Broadcast to WebSocket clients via the running event loop
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(ws_dashboard_manager.broadcast(state))
-            else:
-                loop.run_until_complete(ws_dashboard_manager.broadcast(state))
-        except RuntimeError:
-            # If no event loop available, skip broadcast (next HTTP poll will get it)
-            logger.debug("No event loop for WS broadcast, skipping")
+        state = await _run_cycle_locked()
+        await ws_dashboard_manager.broadcast(state)
     except Exception as e:
-        logger.error(f"Engine cycle error: {e}")
+        logger.exception("Engine cycle error")
 
 
 def eod_report_job():
@@ -265,7 +338,7 @@ async def get_trades():
 
 
 @app.post("/api/orders")
-async def place_order(order: OrderRequest):
+async def place_order(order: OrderRequest, _ok: bool = Depends(_require_api_key)):
     kite = _require_connection()
     result = kite.place_order(
         tradingsymbol=order.tradingsymbol,
@@ -285,7 +358,7 @@ async def place_order(order: OrderRequest):
 
 
 @app.put("/api/orders/{order_id}")
-async def modify_order(order_id: str, body: ModifyOrderRequest):
+async def modify_order(order_id: str, body: ModifyOrderRequest, _ok: bool = Depends(_require_api_key)):
     kite = _require_connection()
     kwargs = body.model_dump(exclude_none=True)
     if not kwargs:
@@ -297,7 +370,7 @@ async def modify_order(order_id: str, body: ModifyOrderRequest):
 
 
 @app.delete("/api/orders/{order_id}")
-async def cancel_order(order_id: str, variety: str = "regular"):
+async def cancel_order(order_id: str, variety: str = "regular", _ok: bool = Depends(_require_api_key)):
     kite = _require_connection()
     result = kite.cancel_order(order_id, variety=variety)
     if not result["success"]:
@@ -337,20 +410,163 @@ async def get_historical(
     days: int = 5,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    oi: bool = False,
 ):
+    """Fetch historical OHLCV data from Kite for any instrument token."""
     kite = _require_connection()
+    if interval not in VALID_INTERVALS:
+        raise HTTPException(400, f"Invalid interval. Must be one of: {VALID_INTERVALS}")
+    max_days = INTERVAL_MAX_DAYS.get(interval, 60)
     if from_date and to_date:
         fd = datetime.strptime(from_date, "%Y-%m-%d")
         td = datetime.strptime(to_date, "%Y-%m-%d")
+        # Clamp to API limit
+        if (td - fd).days > max_days:
+            fd = td - timedelta(days=max_days)
     else:
         td = datetime.now()
-        fd = td - timedelta(days=days)
-    data = kite.get_historical_data(instrument_token, fd, td, interval)
-    return {"count": len(data), "data": data}
+        clamped_days = min(days, max_days)
+        fd = td - timedelta(days=clamped_days)
+    data = kite.get_historical_data(instrument_token, fd, td, interval, oi=oi)
+    # Serialize datetime objects for JSON
+    for row in data:
+        if "date" in row and hasattr(row["date"], "isoformat"):
+            row["date"] = row["date"].isoformat()
+    return {
+        "count": len(data),
+        "instrument_token": instrument_token,
+        "interval": interval,
+        "from_date": fd.strftime("%Y-%m-%d"),
+        "to_date": td.strftime("%Y-%m-%d"),
+        "data": data,
+    }
+
+
+@app.get("/api/market/history/index/{symbol}")
+async def get_index_historical(
+    symbol: str,
+    interval: str = "5minute",
+    days: int = 5,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+):
+    """Fetch historical OHLCV for NIFTY/BANKNIFTY by name (no token needed)."""
+    kite = _require_connection()
+    sym = symbol.upper()
+    token = INDEX_TOKENS.get(sym)
+    if token is None:
+        raise HTTPException(404, f"Unknown index: {symbol}. Available: {list(INDEX_TOKENS.keys())}")
+    if interval not in VALID_INTERVALS:
+        raise HTTPException(400, f"Invalid interval. Must be one of: {VALID_INTERVALS}")
+    max_days = INTERVAL_MAX_DAYS.get(interval, 60)
+    if from_date and to_date:
+        fd = datetime.strptime(from_date, "%Y-%m-%d")
+        td = datetime.strptime(to_date, "%Y-%m-%d")
+        if (td - fd).days > max_days:
+            fd = td - timedelta(days=max_days)
+    else:
+        td = datetime.now()
+        clamped_days = min(days, max_days)
+        fd = td - timedelta(days=clamped_days)
+    data = kite.get_historical_data(token, fd, td, interval)
+    for row in data:
+        if "date" in row and hasattr(row["date"], "isoformat"):
+            row["date"] = row["date"].isoformat()
+    return {
+        "count": len(data),
+        "symbol": sym,
+        "instrument_token": token,
+        "interval": interval,
+        "from_date": fd.strftime("%Y-%m-%d"),
+        "to_date": td.strftime("%Y-%m-%d"),
+        "data": data,
+    }
+
+
+@app.get("/api/market/history/{instrument_token}/csv")
+async def get_historical_csv(
+    instrument_token: int,
+    interval: str = "5minute",
+    days: int = 5,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    oi: bool = False,
+):
+    """Download historical OHLCV data as CSV file."""
+    kite = _require_connection()
+    if interval not in VALID_INTERVALS:
+        raise HTTPException(400, f"Invalid interval. Must be one of: {VALID_INTERVALS}")
+    max_days = INTERVAL_MAX_DAYS.get(interval, 60)
+    if from_date and to_date:
+        fd = datetime.strptime(from_date, "%Y-%m-%d")
+        td = datetime.strptime(to_date, "%Y-%m-%d")
+        if (td - fd).days > max_days:
+            fd = td - timedelta(days=max_days)
+    else:
+        td = datetime.now()
+        clamped_days = min(days, max_days)
+        fd = td - timedelta(days=clamped_days)
+    data = kite.get_historical_data(instrument_token, fd, td, interval, oi=oi)
+    if not data:
+        raise HTTPException(404, "No historical data available for the given parameters")
+
+    # Build CSV in memory
+    output = io.StringIO()
+    fields = ["date", "open", "high", "low", "close", "volume"]
+    if oi:
+        fields.append("oi")
+    writer = csv_mod.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in data:
+        csv_row = dict(row)
+        if "date" in csv_row and hasattr(csv_row["date"], "isoformat"):
+            csv_row["date"] = csv_row["date"].isoformat()
+        writer.writerow(csv_row)
+
+    output.seek(0)
+    filename = f"history_{instrument_token}_{interval}_{fd.strftime('%Y%m%d')}_{td.strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/market/instruments/search")
+async def search_instruments(
+    query: str = Query(..., min_length=2, description="Search by trading symbol"),
+    exchange: str = "NFO",
+    limit: int = 20,
+):
+    """Search instruments by symbol name. Returns matching instruments with tokens."""
+    kite = _require_connection()
+    try:
+        instruments = kite.get_instruments(exchange)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch instruments: {e}")
+
+    q = query.upper()
+    matches = [
+        {
+            "instrument_token": i["instrument_token"],
+            "tradingsymbol": i["tradingsymbol"],
+            "name": i.get("name", ""),
+            "exchange": i.get("exchange", exchange),
+            "expiry": str(i.get("expiry", "")),
+            "strike": i.get("strike", 0),
+            "instrument_type": i.get("instrument_type", ""),
+            "lot_size": i.get("lot_size", 0),
+        }
+        for i in instruments
+        if q in i.get("tradingsymbol", "").upper()
+    ][:limit]
+
+    return {"count": len(matches), "instruments": matches}
 
 
 @app.get("/api/market/instruments")
 async def get_instruments(exchange: Optional[str] = None):
+    """List all instruments, optionally filtered by exchange."""
     kite = _require_connection()
     return kite.get_instruments(exchange)
 
@@ -572,11 +788,60 @@ async def engine_trades():
     return nifty_engine.risk_mgr.get_trades_summary()
 
 
+@app.get("/api/dashboard/equity-curve")
+async def dashboard_equity_curve():
+    """Equity curve data for charting."""
+    return nifty_engine.risk_mgr.get_equity_curve()
+
+
+@app.get("/api/dashboard/trade-stats")
+async def dashboard_trade_stats(lookback: int = 20):
+    """Recent trade statistics (win rate, avg PnL, etc.)."""
+    return nifty_engine.risk_mgr.get_recent_trade_stats(lookback)
+
+
+@app.get("/api/dashboard/strategies")
+async def dashboard_strategies():
+    """List all available strategies and their enabled status."""
+    return {
+        "strategies": [
+            {"name": "ORB Breakout", "key": "nifty_options_orb", "enabled": True},
+            {"name": "Supertrend+EMA", "key": "supertrend_ema", "enabled": True},
+            {"name": "VWAP Mean Reversion", "key": "vwap_mean_reversion", "enabled": settings.enable_vwap_strategy},
+            {"name": "VWAP Breakout", "key": "vwap_breakout", "enabled": settings.enable_vwap_breakout},
+            {"name": "EMA Crossover", "key": "ema_crossover", "enabled": settings.enable_ema_crossover},
+            {"name": "RSI Divergence", "key": "rsi_divergence", "enabled": settings.enable_rsi_divergence},
+            {"name": "PCR/OI Directional", "key": "pcr_oi_directional", "enabled": settings.enable_pcr_oi_strategy},
+            {"name": "Gap Fill", "key": "gap_fill", "enabled": settings.enable_gap_fill},
+            {"name": "Expiry Premium Sell", "key": "expiry_premium_sell", "enabled": settings.enable_expiry_sell_strategy},
+            {"name": "Straddle/Strangle", "key": "straddle_strangle", "enabled": settings.enable_straddle_strangle},
+            {"name": "Iron Condor", "key": "iron_condor", "enabled": settings.enable_iron_condor},
+            {"name": "Hero Zero", "key": "hero_zero", "enabled": settings.enable_hero_zero},
+        ],
+        "instruments": settings.instruments_to_trade.split(","),
+    }
+
+
+@app.get("/api/dashboard/daily-pnl")
+async def dashboard_daily_pnl():
+    """Daily P&L summary."""
+    return {
+        "daily_pnl": nifty_engine.risk_mgr.daily_pnl,
+        "realised_pnl": nifty_engine.risk_mgr.realised_pnl,
+        "unrealised_pnl": nifty_engine.risk_mgr.unrealised_pnl,
+        "capital": nifty_engine.risk_mgr.capital,
+        "trades_today": len(nifty_engine.risk_mgr.open_positions) + len([
+            t for t in nifty_engine.risk_mgr.trades
+            if t.exit_time and t.exit_time[:10] == date.today().isoformat()
+        ]),
+    }
+
+
 @app.post("/api/engine/run-cycle")
-async def engine_run_cycle():
+async def engine_run_cycle(_ok: bool = Depends(_require_api_key)):
     """Manually trigger one engine cycle (for testing)."""
     try:
-        state = nifty_engine.run_cycle()
+        state = await _run_cycle_locked()
         return state
     except Exception as e:
         logger.exception("run_cycle failed")
@@ -584,7 +849,7 @@ async def engine_run_cycle():
 
 
 @app.post("/api/engine/square-off")
-async def engine_square_off():
+async def engine_square_off(_ok: bool = Depends(_require_api_key)):
     """Manually trigger square-off of all positions."""
     kite = _require_connection()
     nifty_engine.square_off_all(kite, "MANUAL_SQUAREOFF")
@@ -666,7 +931,7 @@ class AutoTradeModeRequest(BaseModel):
 
 
 @app.post("/api/engine/auto-trade-mode")
-async def set_auto_trade_mode(req: AutoTradeModeRequest):
+async def set_auto_trade_mode(req: AutoTradeModeRequest, _ok: bool = Depends(_require_api_key)):
     """Switch between off/paper/live auto-trading."""
     if req.mode not in ("off", "paper", "live"):
         raise HTTPException(status_code=400, detail="Mode must be 'off', 'paper', or 'live'")
@@ -675,7 +940,7 @@ async def set_auto_trade_mode(req: AutoTradeModeRequest):
 
 
 @app.post("/api/engine/force-exit/{trade_id}")
-async def force_exit_position(trade_id: str, reason: str = "MANUAL"):
+async def force_exit_position(trade_id: str, reason: str = "MANUAL", _ok: bool = Depends(_require_api_key)):
     """Force exit a specific position."""
     kite = _require_connection()
     success = nifty_engine.order_mgr.full_exit(kite, trade_id, reason=reason)
@@ -697,7 +962,7 @@ async def telegram_status():
 
 
 @app.post("/api/telegram/test")
-async def telegram_test():
+async def telegram_test(_ok: bool = Depends(_require_api_key)):
     """Send a test message to verify Telegram bot setup."""
     result = telegram.test()
     if not result["success"]:
@@ -710,7 +975,7 @@ class TelegramMessageRequest(BaseModel):
 
 
 @app.post("/api/telegram/send")
-async def telegram_send(body: TelegramMessageRequest):
+async def telegram_send(body: TelegramMessageRequest, _ok: bool = Depends(_require_api_key)):
     """Send a custom Telegram message."""
     if not telegram.enabled:
         raise HTTPException(status_code=400, detail="Telegram not configured")
@@ -719,7 +984,7 @@ async def telegram_send(body: TelegramMessageRequest):
 
 
 @app.post("/api/telegram/summary")
-async def telegram_daily_summary():
+async def telegram_daily_summary(_ok: bool = Depends(_require_api_key)):
     """Send today's P&L summary to Telegram."""
     telegram.alert_daily_summary(
         nifty_engine.risk_mgr.get_status(),
@@ -746,7 +1011,7 @@ async def engine_journal():
 
 
 @app.post("/api/engine/send-eod-report")
-async def send_eod_report():
+async def send_eod_report(_ok: bool = Depends(_require_api_key)):
     """Manually trigger EOD report to Telegram."""
     risk_status = nifty_engine.risk_mgr.get_status()
     messages = trade_journal.generate_eod_telegram(risk_status)
@@ -821,8 +1086,6 @@ async def engine_multi_tf():
     }
 
 
-@app.post("/api/backtest/run")
-
 
 # ------------------------------------------------------------------
 # Live OI Feed endpoints
@@ -866,7 +1129,7 @@ async def engine_oi_analysis():
 
 
 @app.post("/api/engine/oi-feed/start")
-async def start_oi_feed():
+async def start_oi_feed(_ok: bool = Depends(_require_api_key)):
     """Manually start the live OI feed."""
     kite = KiteClient.get_instance()
     if not kite.is_connected:
@@ -881,7 +1144,7 @@ async def start_oi_feed():
 
 
 @app.post("/api/engine/oi-feed/stop")
-async def stop_oi_feed():
+async def stop_oi_feed(_ok: bool = Depends(_require_api_key)):
     """Stop the live OI feed."""
     feed = nifty_engine._oi_feed
     if feed:
@@ -889,26 +1152,187 @@ async def stop_oi_feed():
         nifty_engine._oi_feed_started = False
         return {"success": True, "message": "Live OI feed stopped"}
     return {"success": False, "message": "OI feed not running"}
-async def run_backtest(
-    strategy: str = "ORB",
-    days: int = 30,
-    capital: float = 1000000,
+
+
+# --- Backtest request model ---
+class BacktestRequest(BaseModel):
+    strategy: str = "ORB"
+    data_file: str = ""
+    days: int = 30
+    capital: float = 1000000
+
+# Map frontend-friendly names → engine strategy keys
+_STRATEGY_ALIAS = {
+    "momentum": "SUPERTREND",
+    "orb": "ORB",
+    "orb_breakout": "ORB",
+    "vwap_mr": "VWAP_MR",
+    "vwap_mean_reversion": "VWAP_MR",
+    "vwap_breakout": "VWAP_BREAKOUT",
+    "vwap_bo": "VWAP_BREAKOUT",
+    "supertrend": "SUPERTREND",
+    "supertrend_ema": "SUPERTREND",
+    "ema_crossover": "EMA_CROSSOVER",
+    "ema": "EMA_CROSSOVER",
+    "rsi_divergence": "RSI_DIVERGENCE",
+    "rsi": "RSI_DIVERGENCE",
+    "gap_fill": "GAP_FILL",
+    "all": "ALL",
+}
+
+
+def _resolve_strategy(name: str) -> str:
+    """Resolve a frontend strategy name to engine key."""
+    key = name.strip().lower().replace(" ", "_")
+    return _STRATEGY_ALIAS.get(key, name.upper())
+
+
+def _load_csv_and_resample(csv_path: Path) -> pd.DataFrame:
+    """Load a 1-min (or any) CSV and resample to 5-min OHLCV."""
+    df = pd.read_csv(csv_path)
+    df["date"] = pd.to_datetime(df["date"])
+    if df["date"].dt.tz is not None:
+        df["date"] = df["date"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+
+    # Detect interval: if avg gap ≤ 1.5 min → 1-min data, needs resampling
+    if len(df) >= 2:
+        avg_gap = (df["date"].diff().dropna().dt.total_seconds().median()) / 60
+        if avg_gap <= 1.5:
+            # Resample 1-min → 5-min
+            df = df.set_index("date")
+            df = df.resample("5min", label="left", closed="left").agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }).dropna(subset=["open"]).reset_index()
+
+    return df
+
+
+@app.post("/api/backtest/download")
+async def backtest_download(
+    ticker: str = "NIFTY 50",
+    from_date: str = "",
+    to_date: str = "",
 ):
-    """Run a historical backtest."""
+    """Download 1-min historical data from Kite and save to data/ for backtesting."""
+    data_dir = Path(__file__).parent / "data"
+    data_dir.mkdir(exist_ok=True)
+
+    kite = _require_connection()
+
+    # Resolve symbol → instrument token
+    sym = ticker.upper().replace(" ", "")
+    token = INDEX_TOKENS.get(sym) or INDEX_TOKENS.get(ticker.upper().split()[0])
+    if token is None:
+        # Try NIFTY variants
+        for k, v in INDEX_TOKENS.items():
+            if k in sym:
+                token = v
+                break
+    if token is None:
+        token = 256265  # default NIFTY
+
+    if from_date and to_date:
+        fd = datetime.strptime(from_date, "%Y-%m-%d")
+        td = datetime.strptime(to_date, "%Y-%m-%d")
+    else:
+        td = datetime.now()
+        fd = td - timedelta(days=5)
+
+    # Clamp to Kite 1-min limit (60 days)
+    max_days = INTERVAL_MAX_DAYS.get("minute", 60)
+    if (td - fd).days > max_days:
+        fd = td - timedelta(days=max_days)
+
+    data = kite.get_historical_data(token, fd, td, "minute")
+    if not data:
+        raise HTTPException(400, detail="No data returned from Kite for the given range")
+
+    # Build CSV
+    safe_ticker = ticker.lower().replace(" ", "_")
+    filename = f"{safe_ticker}_1m.csv"
+    filepath = data_dir / filename
+
+    output = io.StringIO()
+    fields = ["date", "open", "high", "low", "close", "volume"]
+    writer = csv_mod.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in data:
+        csv_row = dict(row)
+        if "date" in csv_row and hasattr(csv_row["date"], "isoformat"):
+            csv_row["date"] = csv_row["date"].isoformat()
+        writer.writerow(csv_row)
+    filepath.write_text(output.getvalue(), encoding="utf-8")
+
+    return {
+        "success": True,
+        "rows": len(data),
+        "file": f"data/{filename}",
+        "message": f"Downloaded {len(data)} rows to data/{filename}",
+    }
+
+
+@app.post("/api/backtest/run")
+async def run_backtest(req: BacktestRequest):
+    """Run a historical backtest on downloaded CSV data (or live Kite/yfinance)."""
     from backtester import BacktestEngine, DataLoader
 
-    loader = DataLoader()
-    df = loader.load_nifty_history(days=days, interval="5minute", source="yfinance")
-    if df is None or df.empty:
-        raise HTTPException(status_code=400, detail="Failed to load historical data")
+    strategy_key = _resolve_strategy(req.strategy)
+    data_dir = Path(__file__).parent
 
+    # 1. Try loading from the specified data_file
+    df = None
+    if req.data_file:
+        csv_path = data_dir / req.data_file
+        if not csv_path.exists():
+            # Also check just filename in data/
+            csv_path = data_dir / "data" / Path(req.data_file).name
+        if csv_path.exists():
+            try:
+                df = _load_csv_and_resample(csv_path)
+                logger.info(f"Backtest: loaded {len(df)} bars from {csv_path}")
+            except Exception as e:
+                logger.error(f"Backtest CSV load failed: {e}")
+                raise HTTPException(400, detail=f"Failed to load data file: {e}")
+
+    # 2. Fallback: Try any CSV in data/ directory
+    if df is None or df.empty:
+        data_folder = data_dir / "data"
+        if data_folder.exists():
+            csvs = sorted(data_folder.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for csv_path in csvs:
+                try:
+                    df = _load_csv_and_resample(csv_path)
+                    if df is not None and not df.empty:
+                        logger.info(f"Backtest: loaded {len(df)} bars from {csv_path}")
+                        break
+                except Exception:
+                    continue
+
+    # 3. Fallback: Try Kite/yfinance
+    if df is None or df.empty:
+        loader = DataLoader()
+        df = loader.load_nifty_history(days=req.days, interval="5minute", source="kite")
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail="No data available. Download data first using the Download button.")
+
+    # Split into daily sessions
+    loader = DataLoader()
     sessions = loader.split_by_session(df)
     if not sessions:
-        raise HTTPException(status_code=400, detail="No valid sessions in data")
+        raise HTTPException(status_code=400, detail="No valid trading sessions found in data")
 
-    engine = BacktestEngine(strategy=strategy, capital=capital)
-    results = engine.run(sessions)
-    return results.to_dict()
+    try:
+        engine = BacktestEngine(strategy=strategy_key, capital=req.capital)
+        results = engine.run(sessions)
+        return results.to_dict()
+    except Exception as e:
+        logger.error(f"Backtest engine error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Backtest failed: {str(e)}")
 
 
 @app.get("/api/database/trades")
@@ -982,7 +1406,12 @@ async def ws_dashboard(websocket: WebSocket):
         try:
           parsed = json.loads(msg)
           if parsed.get("action") == "run_cycle":
-            state = nifty_engine.run_cycle()
+            # Require API key for manual cycle triggers via WS
+            api_key = parsed.get("api_key")
+            if not settings.api_key or api_key != settings.api_key:
+              await websocket.send_json({"error": "Unauthorized"})
+              continue
+            state = await _run_cycle_locked()
             await websocket.send_json(state)
           elif parsed.get("action") == "get_state":
             await websocket.send_json(nifty_engine.get_dashboard())
@@ -995,654 +1424,30 @@ async def ws_dashboard(websocket: WebSocket):
 
 
 # ============================================================
-# Dashboard HTML page (self-contained)
+# Dashboard HTML page (loaded from external file)
 # ============================================================
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NIFTY Options Engine – Live Dashboard</title>
-<style>
-  :root { --bg: #0f1117; --card: #1a1d29; --accent: #3b82f6; --green: #22c55e;
-           --red: #ef4444; --yellow: #eab308; --text: #e2e8f0; --muted: #94a3b8; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg);
-         color: var(--text); padding: 16px; }
-  h1 { font-size: 1.4rem; margin-bottom: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-          gap: 12px; margin-bottom: 16px; }
-  .card { background: var(--card); border-radius: 10px; padding: 16px; }
-  .card h2 { font-size: 1rem; color: var(--muted); margin-bottom: 8px; }
-  .stat { font-size: 2rem; font-weight: 700; }
-  .stat.green { color: var(--green); }
-  .stat.red { color: var(--red); }
-  .stat.yellow { color: var(--yellow); }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
-           font-size: 0.75rem; font-weight: 600; }
-  .badge-green { background: #22c55e33; color: var(--green); }
-  .badge-red { background: #ef444433; color: var(--red); }
-  .badge-yellow { background: #eab30833; color: var(--yellow); }
-  .badge-blue { background: #3b82f633; color: var(--accent); }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th { text-align: left; color: var(--muted); padding: 6px; border-bottom: 1px solid #2a2d3a; }
-  td { padding: 6px; border-bottom: 1px solid #1f2233; }
-  .bar-bg { background: #2a2d3a; border-radius: 4px; height: 8px; width: 100%; }
-  .bar-fill { height: 8px; border-radius: 4px; background: var(--accent); }
-  .pnl-bar { height: 4px; border-radius: 2px; margin-top: 4px; }
-  .meta { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
-  #status-dot { width: 10px; height: 10px; border-radius: 50%;
-                display: inline-block; margin-right: 6px; }
-  .connected { background: var(--green); }
-  .disconnected { background: var(--red); }
-  .flex { display: flex; align-items: center; gap: 8px; }
-  .conditions li { font-size: 0.8rem; color: var(--muted); margin: 2px 0; }
-  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px;
-           border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
-  button:hover { opacity: 0.85; }
-  button.danger { background: var(--red); }
-  a.kite-chart-link { color: var(--accent); text-decoration: none; font-weight: 700;
-    cursor: pointer; transition: color 0.15s; }
-  a.kite-chart-link:hover { color: #60a5fa; text-decoration: underline; }
-  .news-section { margin-top: 16px; }
-  .news-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
-  .news-tab { background: var(--card); color: var(--muted); border: 1px solid #2a2d3a;
-              padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
-  .news-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .news-list { max-height: 440px; overflow-y: auto; }
-  .news-item { padding: 10px 0; border-bottom: 1px solid #1f2233; }
-  .news-item:last-child { border-bottom: none; }
-  .news-title { font-size: 0.9rem; font-weight: 600; margin-bottom: 3px; }
-  .news-title a { color: var(--text); text-decoration: none; }
-  .news-title a:hover { color: var(--accent); }
-  .news-summary { font-size: 0.78rem; color: var(--muted); line-height: 1.4;
-                  max-height: 2.8em; overflow: hidden; }
-  .news-meta { font-size: 0.7rem; color: #64748b; margin-top: 3px; display: flex; gap: 10px; }
-  .sentiment-bar { display: flex; gap: 12px; align-items: center; margin: 4px 0 8px; }
-  .mood-chip { padding: 4px 12px; border-radius: 12px; font-size: 0.85rem; font-weight: 700; }
-  .mood-BULLISH { background: #22c55e22; color: var(--green); }
-  .mood-BEARISH { background: #ef444422; color: var(--red); }
-  .mood-NEUTRAL { background: #eab30822; color: var(--yellow); }
-</style>
-</head>
-<body>
-
-<div class="flex" style="justify-content: space-between; margin-bottom: 12px;">
-  <h1>🎯 NIFTY Options Engine</h1>
-  <div class="flex">
-    <span id="status-dot" class="disconnected"></span>
-    <span id="ws-status">Disconnected</span>
-    <button onclick="runCycle()">Run Cycle</button>
-    <button class="danger" onclick="squareOff()">Square Off All</button>
-  </div>
-</div>
-
-<div id="offline-bar" style="display:none; align-items:center; gap:12px; padding:8px 16px; margin-bottom:12px; background:#1a1a2e; border:1px solid #ffd700; border-radius:8px;">
-  <span class="offline-label" style="color:#ffd700; font-weight:600;">🌙 Market Closed</span>
-  <button id="offline-btn" onclick="fetchOfflineData()" style="margin-left:auto; background:#ffd700; color:#0a0a1a; border:none; padding:6px 14px; border-radius:6px; cursor:pointer; font-weight:600;">🔄 Fetch Offline Data</button>
-</div>
-
-<!-- Row 1: Key metrics -->
-<div class="grid">
-  <div class="card">
-    <h2>Engine Status</h2>
-    <div class="stat" id="engine-status">IDLE</div>
-    <div class="meta" id="last-update">—</div>
-  </div>
-  <div class="card">
-    <h2>NIFTY Spot</h2>
-    <div class="stat" id="nifty-spot">—</div>
-    <div class="meta" id="orb-range">ORB: —</div>
-  </div>
-  <div class="card">
-    <h2>Daily P&L</h2>
-    <div class="stat" id="daily-pnl">₹0</div>
-    <div class="meta" id="pnl-detail">Realised: — | Unrealised: —</div>
-    <div class="bar-bg"><div class="pnl-bar" id="pnl-bar" style="width:0;background:var(--green)"></div></div>
-  </div>
-  <div class="card">
-    <h2>Open Positions</h2>
-    <div class="stat" id="open-pos">0</div>
-    <div class="meta" id="trades-count">Trades today: 0</div>
-  </div>
-  <div class="card">
-    <h2>OI Analysis</h2>
-    <div style="display:flex;gap:16px;align-items:baseline;">
-      <div><span style="font-size:0.8rem;color:var(--muted)">CE OI:</span> <span class="stat" style="font-size:1.5rem" id="ce-oi-chg">—</span></div>
-      <div><span style="font-size:0.8rem;color:var(--muted)">PE OI:</span> <span class="stat" style="font-size:1.5rem" id="pe-oi-chg">—</span></div>
-    </div>
-    <div class="meta" id="oi-interpretation">OI change % vs previous day (ATM ± 3 strikes)</div>
-  </div>
-  <div class="card">
-    <h2>Safety Filters</h2>
-    <div style="font-size:0.85rem;">
-      <div style="margin-bottom:4px;">VIX: <b id="sf-vix">—</b> <span id="sf-vix-status" class="badge badge-green">OK</span></div>
-      <div style="margin-bottom:4px;">Gap: <b id="sf-gap">NONE</b></div>
-      <div style="margin-bottom:4px;">Multi-TF: 15m=<b id="sf-st15m">—</b> 1h=<b id="sf-st1h">—</b></div>
-      <div style="margin-bottom:4px;">Strategies: <span id="sf-strategies">ORB</span></div>
-    </div>
-    <div class="meta">Orders: <span id="sf-orders">0</span>/<span id="sf-orders-max">10</span></div>
-  </div>
-</div>
-
-<!-- Row 2: Signal + Top Scores -->
-<div class="grid">
-  <div class="card">
-    <h2>Active Signal</h2>
-    <div id="signal-box">
-      <span class="badge badge-blue">NO SIGNAL</span>
-    </div>
-    <ul class="conditions" id="conditions-list"></ul>
-  </div>
-  <div class="card" style="grid-column: span 2;">
-    <h2>Top Scored Candidates (Top 10%)</h2>
-    <table>
-      <thead>
-        <tr><th>Option 📈</th><th>Type</th><th>Entry</th><th>SL</th><th>TGT 1</th><th>TGT 2</th><th>TGT 3</th><th>R:R%</th><th>Score</th><th>OI Chg%</th><th>OI Signal</th><th>Expiry</th></tr>
-      </thead>
-      <tbody id="scores-body"></tbody>
-    </table>
-    <div class="meta" id="score-meta">—</div>
-  </div>
-</div>
-
-<!-- Row 3: Trade log -->
-<div class="card">
-  <h2>Trades Today</h2>
-  <table>
-    <thead>
-      <tr><th>ID</th><th>Symbol</th><th>Type</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Score</th><th>Status</th></tr>
-    </thead>
-    <tbody id="trades-body"></tbody>
-  </table>
-</div>
-
-<!-- Row 3.2: Active Auto-Managed Positions with Trailing SL -->
-<div class="card" style="margin-top:12px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h2>🎯 Active Positions – Trailing SL</h2>
-    <button onclick="loadActivePositions()" style="font-size:0.75rem;padding:4px 10px;">⟳ Refresh</button>
-  </div>
-  <table>
-    <thead>
-      <tr>
-        <th>Symbol</th><th>Type</th><th>Entry</th><th>Qty</th>
-        <th>Init SL</th><th>Trailing SL</th><th>Phase</th><th>Watermark</th>
-        <th>T1</th><th>T2</th><th>T3</th>
-        <th>Targets Hit</th><th>Last TSL Update</th>
-      </tr>
-    </thead>
-    <tbody id="auto-pos-body"></tbody>
-  </table>
-  <div class="meta" id="auto-pos-meta" style="margin-top:6px;">Click "Refresh" or positions update automatically.</div>
-</div>
-
-<!-- Row 3.5: EOD Trade Journal -->
-<div class="card" id="eod-section" style="margin-top:12px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;">
-    <h2>📋 EOD Trade Journal</h2>
-    <div style="display:flex;gap:8px;">
-      <button onclick="fetchEODReport()" style="font-size:0.75rem;padding:4px 10px;">📊 Load Report</button>
-      <button onclick="sendEODTelegram()" style="font-size:0.75rem;padding:4px 10px;background:var(--green);">📲 Send to Telegram</button>
-    </div>
-  </div>
-  <div id="eod-summary" style="display:none;margin-top:10px;">
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:12px;">
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Signals</div><div class="stat" style="font-size:1.4rem;" id="eod-signals">0</div>
-      </div>
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Candidates</div><div class="stat" style="font-size:1.4rem;" id="eod-candidates">0</div>
-      </div>
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Activated</div><div class="stat" style="font-size:1.4rem;" id="eod-activated">0</div>
-      </div>
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Win Rate</div><div class="stat" style="font-size:1.4rem;" id="eod-winrate">—</div>
-      </div>
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Net P&L</div><div class="stat" style="font-size:1.4rem;" id="eod-pnl">₹0</div>
-      </div>
-      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
-        <div class="meta">Avg Duration</div><div class="stat" style="font-size:1.4rem;" id="eod-duration">—</div>
-      </div>
-    </div>
-
-    <h3 style="font-size:0.9rem;color:var(--muted);margin:12px 0 6px;">Trade Details</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Call</th><th>Symbol</th><th>Type</th><th>Signal Entry</th>
-          <th>Activated?</th><th>Actual Entry</th><th>Exit</th>
-          <th>P&L</th><th>Duration</th><th>Reason</th><th>Score</th>
-        </tr>
-      </thead>
-      <tbody id="eod-trades-body"></tbody>
-    </table>
-  </div>
-  <div id="eod-empty" class="meta" style="margin-top:8px;">Click "Load Report" to view today's trade journal.</div>
-</div>
-
-<!-- Row 4: News Section -->
-<div class="news-section">
-  <div class="grid">
-    <div class="card">
-      <h2>📰 Market Mood</h2>
-      <div class="sentiment-bar">
-        <div class="mood-chip" id="mood-chip">LOADING</div>
-        <span class="meta" id="mood-stats">—</span>
-      </div>
-      <div style="display:flex;gap:16px;margin-top:6px;">
-        <div><span style="color:var(--green)">▲</span> Bullish: <b id="bull-count">0</b></div>
-        <div><span style="color:var(--red)">▼</span> Bearish: <b id="bear-count">0</b></div>
-        <div><span style="color:var(--yellow)">—</span> Neutral: <b id="neut-count">0</b></div>
-      </div>
-      <div class="meta" id="news-updated">Last updated: —</div>
-      <button style="margin-top:8px;font-size:0.75rem;padding:4px 10px;" onclick="refreshNews()">⟳ Refresh News</button>
-    </div>
-    <div class="card" style="grid-column: span 2;">
-      <h2>📰 Today's Market News</h2>
-      <div class="news-tabs">
-        <div class="news-tab active" data-cat="top" onclick="switchTab(this,'top')">Top Stories</div>
-        <div class="news-tab" data-cat="india" onclick="switchTab(this,'india')">India</div>
-        <div class="news-tab" data-cat="global" onclick="switchTab(this,'global')">Global</div>
-        <div class="news-tab" data-cat="nifty" onclick="switchTab(this,'nifty')">NIFTY</div>
-        <div class="news-tab" data-cat="commodity" onclick="switchTab(this,'commodity')">Commodities</div>
-        <div class="news-tab" data-cat="forex" onclick="switchTab(this,'forex')">Forex</div>
-      </div>
-      <div class="news-list" id="news-list"><div class="meta">Loading news...</div></div>
-    </div>
-  </div>
-</div>
-
-<script>
-const WS_URL = `ws://${location.host}/ws/dashboard`;
-let ws;
-
-function connect() {
-  ws = new WebSocket(WS_URL);
-  ws.onopen = () => {
-    document.getElementById('status-dot').className = 'connected';
-    document.getElementById('ws-status').textContent = 'Live';
-  };
-  ws.onclose = () => {
-    document.getElementById('status-dot').className = 'disconnected';
-    document.getElementById('ws-status').textContent = 'Disconnected';
-    setTimeout(connect, 3000);
-  };
-  ws.onmessage = (e) => {
-    try { updateDashboard(JSON.parse(e.data)); } catch {}
-  };
-}
-
-function updateDashboard(d) {
-  // Engine status
-  const es = d.engine_status || 'IDLE';
-  document.getElementById('engine-status').textContent = es;
-  document.getElementById('engine-status').className = 'stat ' +
-    (es.includes('HALTED') || es.includes('CLOSED') ? 'red' :
-     es.includes('SIGNAL') ? 'green' : 'yellow');
-  document.getElementById('last-update').textContent =
-    'Cycle #' + (d.cycle_count||0) + ' | ' + (d.last_update||'').replace('T',' ').slice(0,19);
-
-  // Show/hide market-closed banner + offline btn
-  const offlineBar = document.getElementById('offline-bar');
-  if (es === 'MARKET_CLOSED' || es === 'IDLE' || es === 'DISCONNECTED') {
-    offlineBar.style.display = 'flex';
-    offlineBar.querySelector('.offline-label').textContent =
-      es === 'DISCONNECTED' ? '⚠ Broker disconnected' : '🌙 Market Closed – showing last available data';
-  } else {
-    offlineBar.style.display = 'none';
-  }
-
-  // Spot + ORB
-  document.getElementById('nifty-spot').textContent = d.nifty_spot ? d.nifty_spot.toFixed(2) : '—';
-  const orb = d.orb || {};
-  document.getElementById('orb-range').textContent = orb.captured
-    ? `ORB: [${orb.low?.toFixed(2)} – ${orb.high?.toFixed(2)}]` : 'ORB: waiting…';
-
-  // P&L
-  const risk = d.risk || {};
-  const pnl = risk.daily_pnl || 0;
-  document.getElementById('daily-pnl').textContent = '₹' + pnl.toFixed(2);
-  document.getElementById('daily-pnl').className = 'stat ' + (pnl >= 0 ? 'green' : 'red');
-  document.getElementById('pnl-detail').textContent =
-    `Realised: ₹${(risk.realised_pnl||0).toFixed(2)} | Unrealised: ₹${(risk.unrealised_pnl||0).toFixed(2)}`;
-  const limit = risk.daily_loss_limit || 1;
-  const pnlPct = Math.min(100, Math.abs(pnl) / limit * 100);
-  const bar = document.getElementById('pnl-bar');
-  bar.style.width = pnlPct + '%';
-  bar.style.background = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-
-  // Open positions
-  document.getElementById('open-pos').textContent = risk.open_positions || 0;
-  document.getElementById('trades-count').textContent =
-    `Trades today: ${risk.total_trades_today||0} | Halted: ${risk.trading_halted?'YES':'NO'}`;
-
-  // OI Analysis
-  const oi = d.oi_analysis || {};
-  const ceOiEl = document.getElementById('ce-oi-chg');
-  const peOiEl = document.getElementById('pe-oi-chg');
-  const ceChg = oi.ce_oi_change_pct || 0;
-  const peChg = oi.pe_oi_change_pct || 0;
-  ceOiEl.textContent = ceChg !== 0 ? (ceChg > 0 ? '+' : '') + ceChg.toFixed(1) + '%' : '—';
-  ceOiEl.style.color = ceChg > 0 ? 'var(--red)' : ceChg < 0 ? 'var(--green)' : 'var(--muted)';
-  peOiEl.textContent = peChg !== 0 ? (peChg > 0 ? '+' : '') + peChg.toFixed(1) + '%' : '—';
-  peOiEl.style.color = peChg > 0 ? 'var(--red)' : peChg < 0 ? 'var(--green)' : 'var(--muted)';
-  // Interpretation
-  const oiInterpEl = document.getElementById('oi-interpretation');
-  if (ceChg !== 0 || peChg !== 0) {
-    let mood = '';
-    if (ceChg < -2 && peChg > 2) mood = '🟢 Bullish OI (CE unwinding + PE writing)';
-    else if (ceChg > 2 && peChg < -2) mood = '🔴 Bearish OI (CE writing + PE unwinding)';
-    else if (ceChg > 5) mood = '🔴 Heavy CE writing (bearish)';
-    else if (peChg > 5) mood = '🔴 Heavy PE buildup (bearish)';
-    else if (ceChg < -5) mood = '🟢 CE short covering (bullish)';
-    else if (peChg < -5) mood = '🟢 PE unwinding (bullish)';
-    else mood = '🟡 Mixed OI signals';
-    oiInterpEl.textContent = mood;
-  }
-
-  // Safety Filters
-  const sf = d.safety_filters || {};
-  const vixVal = d.india_vix || sf.india_vix || 0;
-  document.getElementById('sf-vix').textContent = vixVal ? vixVal.toFixed(1) : '—';
-  const vixSt = document.getElementById('sf-vix-status');
-  if (vixVal > 20) { vixSt.textContent='HIGH'; vixSt.className='badge badge-red'; }
-  else if (vixVal > 15) { vixSt.textContent='WARN'; vixSt.className='badge badge-yellow'; }
-  else { vixSt.textContent='OK'; vixSt.className='badge badge-green'; }
-  const gapType = sf.gap_type || d.gap_type || 'NONE';
-  const gapPct = sf.gap_pct || d.gap_pct || 0;
-  document.getElementById('sf-gap').textContent = gapType + (gapPct ? ' (' + gapPct.toFixed(2) + '%)' : '');
-  document.getElementById('sf-st15m').textContent = sf.st_dir_15m === 1 ? '▲' : sf.st_dir_15m === -1 ? '▼' : '—';
-  document.getElementById('sf-st1h').textContent = sf.st_dir_1h === 1 ? '▲' : sf.st_dir_1h === -1 ? '▼' : '—';
-  const strats = [];
-  strats.push('ORB');
-  if (sf.vwap_enabled) strats.push('VWAP');
-  if (sf.expiry_sell_enabled) strats.push('ExpSell');
-  if (sf.trend_mode_enabled) strats.push('TREND');
-  document.getElementById('sf-strategies').textContent = strats.join(' | ') || 'ORB';
-  document.getElementById('sf-orders').textContent = risk.total_trades_today || 0;
-  document.getElementById('sf-orders-max').textContent = sf.max_orders || 10;
-
-  // Signal
-  const sig = d.signal;
-  const box = document.getElementById('signal-box');
-  const cList = document.getElementById('conditions-list');
-  cList.innerHTML = '';
-  if (sig) {
-    const cls = sig.type === 'BUY' ? 'badge-green' : 'badge-red';
-    box.innerHTML = `<span class="badge ${cls}">${sig.type}</span>
-      <span style="margin-left:8px">Entry: ${sig.entry?.toFixed(2)} | SL: ${sig.sl?.toFixed(2)} | Tgt: ${sig.target?.toFixed(2)}</span>
-      <div class="meta">Confidence: ${sig.confidence?.toFixed(1)}%</div>`;
-    (sig.conditions || []).forEach(c => {
-      const li = document.createElement('li');
-      li.textContent = '✓ ' + c;
-      cList.appendChild(li);
-    });
-  } else {
-    box.innerHTML = '<span class="badge badge-blue">NO SIGNAL</span>';
-  }
-
-  // Scores table
-  const tc = d.top_candidates || {};
-  const tops = tc.top || [];
-  const tbody = document.getElementById('scores-body');
-  tbody.innerHTML = '';
-  tops.forEach(s => {
-    const tr = document.createElement('tr');
-    const name = s.display_name || s.symbol;
-    const cls = s.type === 'CE' ? 'badge-green' : 'badge-red';
-    const oiChg = s.oi_change_pct || 0;
-    const oiCls = oiChg > 0 ? 'color:var(--green)' : oiChg < 0 ? 'color:var(--red)' : '';
-    const oiInterp = s.oi_interpretation || '—';
-    // Build Kite chart URL: https://kite.zerodha.com/markets/ext/chart/web/tvc/NFO-OPT/{tradingsymbol}/{instrument_token}
-    const kiteChartUrl = s.instrument_token
-      ? `https://kite.zerodha.com/markets/ext/chart/web/tvc/NFO-OPT/${encodeURIComponent(s.symbol)}/${s.instrument_token}`
-      : null;
-    const nameHtml = kiteChartUrl
-      ? `<a class="kite-chart-link" href="${kiteChartUrl}" target="_blank" title="Open premium chart on Kite">${name}</a>`
-      : `<b>${name}</b>`;
-    tr.innerHTML = `<td>${nameHtml}</td>
-      <td><span class="badge ${cls}">${s.type}</span></td>
-      <td><b>₹${(s.entry||s.ltp)?.toFixed(0)}</b></td>
-      <td>₹${(s.stoploss||0)?.toFixed(0)}</td>
-      <td>₹${(s.target1||0)?.toFixed(0)}</td>
-      <td>₹${(s.target2||0)?.toFixed(0)}</td>
-      <td>₹${(s.target3||0)?.toFixed(0)}+</td>
-      <td><b>${(s.risk_reward_pct||0)?.toFixed(1)}%</b></td>
-      <td><b>${s.score?.toFixed(1)}</b></td>
-      <td style="${oiCls}">${oiChg > 0 ? '+' : ''}${oiChg.toFixed(1)}%</td>
-      <td class="meta">${oiInterp}</td>
-      <td>${s.expiry||''}</td>`;
-    tbody.appendChild(tr);
-  });
-  document.getElementById('score-meta').textContent =
-    `${tc.count||0} candidates (top 10% of ${d.all_candidates_count||'—'}) | Avg score: ${tc.avg_score||0} | Max: ${tc.max_score||0}`;
-
-  // Trades table
-  const trades = d.trades || [];
-  const ttbody = document.getElementById('trades-body');
-  ttbody.innerHTML = '';
-  trades.forEach(t => {
-    const tr = document.createElement('tr');
-    const pnlCls = t.pnl >= 0 ? 'green' : 'red';
-    tr.innerHTML = `<td>${t.trade_id?.slice(-8)}</td><td>${t.symbol}</td><td>${t.type}</td>
-      <td>₹${t.entry?.toFixed(2)}</td><td>${t.exit?'₹'+t.exit.toFixed(2):'—'}</td>
-      <td>${t.qty}</td><td style="color:var(--${pnlCls})">₹${t.pnl?.toFixed(2)}</td>
-      <td>${t.score?.toFixed(1)}</td><td>${t.status}</td>`;
-    ttbody.appendChild(tr);
-  });
-}
-
-function runCycle() { ws && ws.send(JSON.stringify({action: 'run_cycle'})); }
-function squareOff() {
-  if (confirm('Square off ALL open positions?'))
-    fetch('/api/engine/square-off', {method:'POST'}).then(r=>r.json()).then(d=>alert(d.message));
-}
-
-// ── Active Positions with Trailing SL ──
-function loadActivePositions() {
-  fetch('/api/engine/active-positions').then(r=>r.json()).then(data=>{
-    const positions = data.positions || [];
-    const tbody = document.getElementById('auto-pos-body');
-    tbody.innerHTML = '';
-    positions.forEach(p => {
-      const tr = document.createElement('tr');
-      const typeCls = p.option_type === 'CE' ? 'badge-green' : 'badge-red';
-      const phaseCls = p.trailing_phase === 'TIGHT' ? 'badge-green'
-        : p.trailing_phase === 'TRAIL_T2' ? 'badge-green'
-        : p.trailing_phase === 'TRAIL_T1' ? 'badge-blue'
-        : p.trailing_phase === 'BREAKEVEN' ? 'badge-yellow'
-        : 'badge-red';
-      const tslImproved = p.trailing_sl > p.sl;
-      const tslStyle = tslImproved ? 'color:var(--green);font-weight:700' : '';
-      const targets = [];
-      if (p.t1_hit) targets.push('T1✓');
-      if (p.t2_hit) targets.push('T2✓');
-      if (p.t3_hit) targets.push('T3✓');
-      const targetsStr = targets.length ? targets.join(' ') : '—';
-      const lastUpdate = p.last_tsl_update || '—';
-      tr.innerHTML = `
-        <td><b>${p.symbol?.split(':').pop() || p.symbol}</b></td>
-        <td><span class="badge ${typeCls}">${p.option_type}</span></td>
-        <td>₹${(p.entry||0).toFixed(1)}</td>
-        <td>${p.remaining_qty}/${p.qty}</td>
-        <td>₹${(p.sl||0).toFixed(1)}</td>
-        <td style="${tslStyle}">₹${(p.trailing_sl||0).toFixed(1)}</td>
-        <td><span class="badge ${phaseCls}">${p.trailing_phase||'INITIAL'}</span></td>
-        <td>₹${(p.highest_price||0).toFixed(1)}</td>
-        <td>₹${(p.t1||0).toFixed(0)}</td>
-        <td>₹${(p.t2||0).toFixed(0)}</td>
-        <td>₹${(p.t3||0).toFixed(0)}</td>
-        <td>${targetsStr}</td>
-        <td class="meta">${lastUpdate}</td>`;
-      tbody.appendChild(tr);
-    });
-    document.getElementById('auto-pos-meta').textContent =
-      `${positions.length} active position(s) | Auto-refreshes every cycle`;
-  }).catch(()=>{
-    document.getElementById('auto-pos-meta').textContent = 'Failed to load positions';
-  });
-}
-// Auto-refresh active positions every 30 seconds
-setInterval(loadActivePositions, 30000);
-// Load once on page load
-setTimeout(loadActivePositions, 2000);
-function fetchOfflineData() {
-  document.getElementById('offline-btn').textContent = 'Loading…';
-  fetch('/api/engine/offline-data').then(r=>r.json()).then(d=>{
-    updateDashboard(d);
-    document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data';
-  }).catch(()=>{ document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data'; });
-}
-
-// ── EOD Trade Journal functions ──
-function fetchEODReport() {
-  document.getElementById('eod-empty').textContent = 'Loading…';
-  fetch('/api/engine/eod-report').then(r=>r.json()).then(data=>{
-    const s = data.summary || {};
-    document.getElementById('eod-signals').textContent = s.total_signals || 0;
-    document.getElementById('eod-candidates').textContent = s.total_candidates || 0;
-    document.getElementById('eod-activated').textContent = s.activated_count || 0;
-    document.getElementById('eod-winrate').textContent = (s.win_rate||0).toFixed(0) + '%';
-    const pnl = s.total_pnl || 0;
-    const pnlEl = document.getElementById('eod-pnl');
-    pnlEl.textContent = '₹' + pnl.toFixed(0);
-    pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-    document.getElementById('eod-duration').textContent = s.avg_duration || '—';
-
-    // Populate trade details table
-    const tbody = document.getElementById('eod-trades-body');
-    tbody.innerHTML = '';
-    (data.trades || []).forEach((t, i) => {
-      const tr = document.createElement('tr');
-      const activated = t.activated;
-      const pnlVal = t.pnl || 0;
-      const pnlCls = pnlVal >= 0 ? 'green' : 'red';
-      const activatedBadge = activated
-        ? '<span class="badge badge-green">YES</span>'
-        : '<span class="badge badge-yellow">NO</span>';
-      tr.innerHTML = `<td>${i+1}</td>
-        <td><b>${t.display_name||t.symbol}</b></td>
-        <td><span class="badge ${t.option_type==='CE'?'badge-green':'badge-red'}">${t.option_type}</span></td>
-        <td>₹${(t.suggested_entry||0).toFixed(0)}</td>
-        <td>${activatedBadge}</td>
-        <td>${activated?'₹'+(t.actual_entry||0).toFixed(2):'—'}</td>
-        <td>${activated&&t.actual_exit?'₹'+t.actual_exit.toFixed(2):'—'}</td>
-        <td style="color:var(--${pnlCls});font-weight:700">${activated?'₹'+pnlVal.toFixed(2):'—'}</td>
-        <td>${t.duration||'—'}</td>
-        <td>${t.exit_reason||t.status||'—'}</td>
-        <td>${(t.score||0).toFixed(0)}</td>`;
-      tbody.appendChild(tr);
-    });
-
-    document.getElementById('eod-summary').style.display = 'block';
-    document.getElementById('eod-empty').style.display = 'none';
-  }).catch(e=>{
-    document.getElementById('eod-empty').textContent = 'Failed to load report.';
-  });
-}
-
-function sendEODTelegram() {
-  fetch('/api/engine/send-eod-report', {method:'POST'}).then(r=>r.json()).then(d=>{
-    alert('EOD report sent to Telegram! (' + (d.messages_sent||0) + ' messages)');
-  }).catch(()=>alert('Failed to send EOD report.'));
-}
-
-// ── News functions ──
-let newsData = null;
-let currentTab = 'top';
-
-function fetchNews(refresh=false) {
-  const url = refresh ? '/api/news?refresh=true' : '/api/news';
-  fetch(url).then(r=>r.json()).then(data => {
-    newsData = data;
-    updateMood(data.sentiment_summary || {});
-    renderNews(currentTab);
-    document.getElementById('news-updated').textContent =
-      'Last updated: ' + (data.last_updated||"").replace('T',' ').slice(0,19)
-      + ' | ' + (data.total_articles||0) + ' articles';
-  }).catch(()=>{});
-}
-
-function updateMood(s) {
-  const chip = document.getElementById('mood-chip');
-  chip.textContent = s.overall_mood || 'NEUTRAL';
-  chip.className = 'mood-chip mood-' + (s.overall_mood||'NEUTRAL');
-  document.getElementById('mood-stats').textContent = 'Avg sentiment: ' + (s.avg_sentiment||0).toFixed(4);
-  document.getElementById('bull-count').textContent = s.bullish_count || 0;
-  document.getElementById('bear-count').textContent = s.bearish_count || 0;
-  document.getElementById('neut-count').textContent = s.neutral_count || 0;
-}
-
-function renderNews(tab) {
-  if (!newsData) return;
-  const list = document.getElementById('news-list');
-  let articles = [];
-  const cats = newsData.categories || {};
-  if (tab === 'top') articles = newsData.top_stories || [];
-  else if (tab === 'india') articles = [...(cats.india_market||[]), ...(cats.nifty||[]), ...(cats.sector||[])];
-  else if (tab === 'global') articles = [...(cats.global_market||[]), ...(cats.commodity||[]), ...(cats.forex||[])];
-  else articles = cats[tab] || [];
-  // Sort by relevance
-  articles.sort((a,b) => (b.relevance_score||0) - (a.relevance_score||0));
-  if (!articles.length) {
-    list.innerHTML = '<div class="meta">No articles in this category.</div>';
-    return;
-  }
-  list.innerHTML = articles.slice(0, 30).map(a => {
-    const sentCls = a.sentiment_label==='bullish' ? 'badge-green' : a.sentiment_label==='bearish' ? 'badge-red' : 'badge-yellow';
-    const timeStr = a.published ? new Date(a.published).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}) : '';
-    return `<div class="news-item">
-      <div class="news-title"><a href="${a.url}" target="_blank">${a.title}</a></div>
-      <div class="news-summary">${a.summary||''}</div>
-      <div class="news-meta">
-        <span>${a.source}</span><span>${timeStr}</span>
-        <span class="badge ${sentCls}">${a.sentiment_label} ${a.sentiment>0?'+':''}${a.sentiment?.toFixed(3)||''}</span>
-        <span>Rel: ${a.relevance_score?.toFixed(0)||0}</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function switchTab(el, tab) {
-  currentTab = tab;
-  document.querySelectorAll('.news-tab').forEach(t => t.classList.remove('active'));
-  el.classList.add('active');
-  renderNews(tab);
-}
-
-function refreshNews() { fetchNews(true); }
-
-connect();
-// Fetch news on load + every 10 min
-fetchNews();
-setInterval(fetchNews, 600000);
-// Also poll engine every 30s as fallback
-setInterval(() => {
-  fetch('/api/engine/dashboard').then(r=>r.json()).then(updateDashboard).catch(()=>{});
-}, 30000);
-// Auto-fetch offline data on page load if market is closed
-fetch('/api/engine/dashboard').then(r=>r.json()).then(d => {
-  updateDashboard(d);
-  const st = d.engine_status || 'IDLE';
-  if (st === 'MARKET_CLOSED' || st === 'IDLE' || st === 'DISCONNECTED') {
-    fetchOfflineData();
-  }
-}).catch(()=>{});
-</script>
-</body>
-</html>
-"""
+DASHBOARD_HTML_PATH = Path(__file__).parent / "dashboard.html"
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page():
     """Self-contained live dashboard."""
-    return DASHBOARD_HTML
+    if not DASHBOARD_HTML_PATH.exists():
+        return HTMLResponse("<h2>dashboard.html not found</h2>", status_code=404)
+    return HTMLResponse(DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
+
+
+# Serve API Test HTML page at /api_test.html and /dashboard/api_test.html
+API_TEST_HTML_PATH = Path(__file__).parent / "api_test.html"
+
+@app.get("/api_test.html", response_class=HTMLResponse)
+@app.get("/dashboard/api_test.html", response_class=HTMLResponse)
+async def api_test_page():
+  """Serve the API Test Dashboard HTML page."""
+  if not API_TEST_HTML_PATH.exists():
+    return HTMLResponse("<h2>api_test.html not found</h2>", status_code=404)
+  return HTMLResponse(API_TEST_HTML_PATH.read_text(encoding="utf-8"))
 
 
 # ============================================================

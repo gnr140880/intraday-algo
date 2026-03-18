@@ -1,4 +1,3 @@
-from datetime import datetime, timedelta, date, time
 """
 NIFTY Options Engine – Orchestrator
 
@@ -24,6 +23,16 @@ from config import settings
 from strategies.nifty_options_orb import NiftyOptionsORBStrategy
 from strategies.vwap_mean_reversion import VWAPMeanReversionStrategy
 from strategies.expiry_premium_sell import ExpiryPremiumSellStrategy
+from strategies.pcr_oi_directional import PCROIDirectionalStrategy
+from strategies.vwap_breakout import VWAPBreakoutStrategy
+from strategies.ema_crossover import EMACrossoverStrategy
+from strategies.rsi_divergence import RSIDivergenceStrategy
+from strategies.gap_fill import GapFillStrategy
+from strategies.straddle_strangle import StraddleStrangleSellStrategy
+from strategies.iron_condor import IronCondorStrategy
+from strategies.bollinger_mean_reversion import BollingerMeanReversionStrategy
+from strategies.orb_range_scalper import ORBRangeScalperStrategy
+from market_regime import detect_regime, filter_signals_by_regime, MarketRegime
 from scoring_engine import ScoringEngine, OptionCandidate
 from risk_manager import RiskManager, TradeRecord
 from telegram_alerts import telegram
@@ -44,6 +53,43 @@ from live_oi_feed import LiveOIFeed
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# Market Session Guard – IST 9:15 AM to 3:30 PM, Mon-Fri
+# ============================================================
+def is_market_open() -> bool:
+    """Check if we are within Indian trading hours (IST 9:15 AM – 3:30 PM, Mon–Fri)."""
+    import pytz
+    tz = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(tz=tz)
+
+    # Weekend check (0=Monday, 6=Sunday)
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
+
+    # Time check: 09:15 – 15:30 IST
+    market_open = time(9, 15)
+    market_close = time(15, 30)
+    return market_open <= now.time() <= market_close
+
+
+def should_skip_new_trades() -> Tuple[bool, str]:
+    """
+    Check if we should skip new trade entry based on:
+    1. Market hours (IST 9:15 AM – 3:30 PM, Mon–Fri)
+    2. Trading mode (paper/live only, not 'off')
+    Returns: (skip: bool, reason: str)
+    """
+    if not is_market_open():
+        return (True, "Market closed (outside 9:15 AM – 3:30 PM IST or weekend)")
+
+    if settings.trading_mode not in ("paper", "live"):
+        return (True, f"Trading mode is '{settings.trading_mode}' (only 'paper' or 'live' allows trades)")
+
+    if not settings.auto_trade_enabled:
+        return (True, "Auto-trading disabled in config (auto_trade_enabled=False)")
+
+    return (False, "OK")
+
 # Instrument configuration (multi-instrument support)
 INSTRUMENT_CONFIG = {
     "NIFTY": {
@@ -52,7 +98,9 @@ INSTRUMENT_CONFIG = {
         "nfo_name": "NIFTY",
         "lot_size_setting": "nifty_lot_size",
         "strike_gap": 50,
-        "default_lot_size": 65,
+        "default_lot_size": 75,
+        "token": 256265,
+        "expiry_day": 3,            # Thursday (0=Mon)
     },
     "BANKNIFTY": {
         "name": "BANKNIFTY",
@@ -61,6 +109,38 @@ INSTRUMENT_CONFIG = {
         "lot_size_setting": "banknifty_lot_size",
         "strike_gap": 100,
         "default_lot_size": 30,
+        "token": 260105,
+        "expiry_day": 2,            # Wednesday
+    },
+    "FINNIFTY": {
+        "name": "FINNIFTY",
+        "spot_symbol": "NSE:NIFTY FIN SERVICE",
+        "nfo_name": "FINNIFTY",
+        "lot_size_setting": "finnifty_lot_size",
+        "strike_gap": 50,
+        "default_lot_size": 40,
+        "token": 257801,
+        "expiry_day": 1,            # Tuesday
+    },
+    "MIDCPNIFTY": {
+        "name": "MIDCPNIFTY",
+        "spot_symbol": "NSE:NIFTY MID SELECT",
+        "nfo_name": "MIDCPNIFTY",
+        "lot_size_setting": "midcpnifty_lot_size",
+        "strike_gap": 25,
+        "default_lot_size": 75,
+        "token": 288009,
+        "expiry_day": 0,            # Monday
+    },
+    "SENSEX": {
+        "name": "SENSEX",
+        "spot_symbol": "BSE:SENSEX",
+        "nfo_name": "SENSEX",
+        "lot_size_setting": "sensex_lot_size",
+        "strike_gap": 100,
+        "default_lot_size": 20,
+        "token": None,              # BSE token differs
+        "expiry_day": 4,            # Friday
     },
 }
 
@@ -78,6 +158,24 @@ class NiftyOptionsEngine:
         self.strategy = NiftyOptionsORBStrategy()
         self.vwap_strategy = VWAPMeanReversionStrategy()
         self.expiry_strategy = ExpiryPremiumSellStrategy()
+        self.hero_zero_strategy = None
+        try:
+            from strategies.hero_zero_expiry import HeroZeroExpiryStrategy
+            self.hero_zero_strategy = HeroZeroExpiryStrategy()
+        except Exception:
+            self.hero_zero_strategy = None
+        # New strategies
+        self.pcr_oi_strategy = PCROIDirectionalStrategy()
+        self.vwap_breakout_strategy = VWAPBreakoutStrategy()
+        self.ema_crossover_strategy = EMACrossoverStrategy()
+        self.rsi_divergence_strategy = RSIDivergenceStrategy()
+        self.gap_fill_strategy = GapFillStrategy()
+        self.straddle_strategy = StraddleStrangleSellStrategy()
+        self.iron_condor_strategy = IronCondorStrategy()
+        # Sideways / range-bound strategies
+        self.bollinger_mr_strategy = BollingerMeanReversionStrategy()
+        self.orb_scalper_strategy = ORBRangeScalperStrategy()
+
         self.scorer = ScoringEngine()
         self.risk_mgr = RiskManager(
             capital=settings.default_capital,
@@ -145,7 +243,27 @@ class NiftyOptionsEngine:
         self.nifty_spot_symbol: Optional[str] = None
         self._orb_captured: bool = False
         self._cached_levels: Optional[IntraDayLevels] = None
+        self._cached_df: Optional[pd.DataFrame] = None
+        self._cached_oi_data: Dict = {}  # OI analysis: ce/pe change %, per-strike OI
         self._today: Optional[date] = None
+        self._cycle_count = 0
+        self._alerted_signal_key: Optional[str] = None   # "BUY@24700" — skip re-alerting same signal
+        self._alerted_strikes: set = set()                # strikes already sent via Telegram
+        self._traded_strikes: set = set()                 # strikes already attempted for execution
+
+        # Safety filters state
+        self._india_vix: float = 0.0           # Current India VIX reading
+        self._last_sl_hit: Dict[str, datetime] = {}  # direction → last SL-hit time for cooldown
+
+        # Gap-day classification state
+        self._gap_type: str = "NONE"           # GAP_UP, LARGE_GAP_UP, GAP_DOWN, LARGE_GAP_DOWN, NONE
+        self._gap_pct: float = 0.0             # gap magnitude in %
+
+        # Multi-timeframe state
+        self._st_dir_15m: int = 0              # supertrend direction on 15m
+        self._st_dir_1h: int = 0               # supertrend direction on 1h
+
+        # Dashboard state (live)
         self.dashboard_state: Dict = {
             "engine_status": "IDLE",
             "orb": {"high": None, "low": None, "captured": False},
@@ -166,6 +284,7 @@ class NiftyOptionsEngine:
         self._load_nfo_instruments()
         self._build_option_index()
         self._init_nifty_spot_token()
+
     def _build_option_index(self):
         """Build option index for O(1) lookup and strike ladder."""
         option_index = {}
@@ -226,6 +345,7 @@ class NiftyOptionsEngine:
         except Exception as e:
             self._nfo_instruments = []
             logger.error(f"Failed to load NFO instruments from CSV: {e}")
+
     def _init_nifty_spot_token(self):
         """
         Fetch and set the correct NIFTY spot instrument token and symbol from Zerodha instruments.
@@ -242,43 +362,6 @@ class NiftyOptionsEngine:
             logger.warning("NIFTY spot instrument not found in Zerodha instruments.")
         except Exception as e:
             logger.error(f"Failed to resolve NIFTY spot instrument: {e}")
-        self._orb_captured = False
-        self._today: Optional[date] = None
-        self._cycle_count = 0
-        self._alerted_signal_key: Optional[str] = None   # "BUY@24700" — skip re-alerting same signal
-        self._alerted_strikes: set = set()                # strikes already sent via Telegram
-        self._traded_strikes: set = set()                 # strikes already attempted for execution
-        self._cached_levels: Optional[IntraDayLevels] = None
-        self._cached_df: Optional[pd.DataFrame] = None
-        self._cached_oi_data: Dict = {}  # OI analysis: ce/pe change %, per-strike OI
-
-        # Safety filters state
-        self._india_vix: float = 0.0           # Current India VIX reading
-        self._last_sl_hit: Dict[str, datetime] = {}  # direction → last SL-hit time for cooldown
-
-        # Gap-day classification state
-        self._gap_type: str = "NONE"           # GAP_UP, LARGE_GAP_UP, GAP_DOWN, LARGE_GAP_DOWN, NONE
-        self._gap_pct: float = 0.0             # gap magnitude in %
-
-        # Multi-timeframe state
-        self._st_dir_15m: int = 0              # supertrend direction on 15m
-        self._st_dir_1h: int = 0               # supertrend direction on 1h
-
-        # Dashboard state (live)
-        self.dashboard_state: Dict = {
-            "engine_status": "IDLE",
-            "orb": {"high": None, "low": None, "captured": False},
-            "signal": None,
-            "top_candidates": [],
-            "risk": {},
-            "trades": [],
-            "levels": {},
-            "auto_trade_mode": self.auto_trade_mode,
-            "active_positions": [],
-            "order_log": [],
-            "oi_analysis": {"ce_oi_change_pct": 0, "pe_oi_change_pct": 0},
-            "last_update": None,
-        }
 
     # ------------------------------------------------------------------
     # Initialise for the day
@@ -1038,6 +1121,16 @@ class NiftyOptionsEngine:
             qty = reduced_lots * settings.nifty_lot_size
             logger.info(f"Qty reduced by factor {qty_factor}: {qty} units")
         if qty <= 0:
+            skip_reason = f"Trade skipped: calculated quantity is zero for {candidate.tradingsymbol} | Entry: {entry_price} | SL: {smart.option_sl} | Risk/unit: {risk_per_unit}"
+            logger.warning(skip_reason)
+            self.dashboard_state.setdefault("skipped_signals", []).append({
+                "symbol": candidate.tradingsymbol,
+                "reason": skip_reason,
+                "entry": entry_price,
+                "sl": smart.option_sl,
+                "score": candidate.score,
+                "time": datetime.now().isoformat(),
+            })
             return None
 
         # Use AutoOrderManager for entry + SL placement
@@ -1051,6 +1144,17 @@ class NiftyOptionsEngine:
             score=candidate.score,
         )
 
+        if pos is None:
+            skip_reason = f"Trade skipped: risk manager or broker failure for {candidate.tradingsymbol}"
+            logger.warning(skip_reason)
+            self.dashboard_state.setdefault("skipped_signals", []).append({
+                "symbol": candidate.tradingsymbol,
+                "reason": skip_reason,
+                "entry": entry_price,
+                "sl": smart.option_sl,
+                "score": candidate.score,
+                "time": datetime.now().isoformat(),
+            })
         return pos
 
     # ------------------------------------------------------------------
@@ -1369,7 +1473,7 @@ class NiftyOptionsEngine:
                     # Telegram alert for significant TSL moves
                     gain_pct = ((ltp - pos.entry_price) / pos.entry_price * 100) if pos.entry_price > 0 else 0
                     if new_phase != "INITIAL":
-                        telegram._send(
+                        telegram.send_custom(
                             f"🛡️ <b>TSL UPDATE: {pos.symbol}</b>\n"
                             f"SL: ₹{old_tsl:.2f} → <b>₹{new_tsl:.2f}</b>\n"
                             f"Phase: {new_phase}\n"
@@ -1415,7 +1519,7 @@ class NiftyOptionsEngine:
 
                 if exit_sig:
                     logger.info(
-                        f"EXIT SIGNAL for {pos.symbol}: {exit_sig.reason.value} "
+                        f"EXIT SIGNAL DETECTED for {pos.symbol}: {exit_sig.reason.value} "
                         f"({exit_sig.priority.value}) exit_pct={exit_sig.exit_pct} "
                         f"tsl_phase={pos.trailing_phase}"
                     )
@@ -1429,7 +1533,10 @@ class NiftyOptionsEngine:
 
                     # Send Telegram alert for exit signal (not for TSL-only tightenings)
                     if exit_sig.exit_pct > 0:
-                        telegram._send(
+                        logger.info(
+                            f"Sending Telegram EXIT alert for {pos.symbol} | Reason: {exit_sig.reason.value} | Trade ID: {trade_id}"
+                        )
+                        telegram.send_custom(
                             f"🚪 <b>EXIT SIGNAL: {exit_sig.reason.value}</b>\n"
                             f"Symbol: {pos.symbol}\n"
                             f"Priority: {exit_sig.priority.value}\n"
@@ -1447,7 +1554,7 @@ class NiftyOptionsEngine:
                         # Record in journal if position is now closed
                         updated_pos = self.order_mgr.positions.get(trade_id)
                         if updated_pos and updated_pos.status == "CLOSED":
-                            pnl = (ltp - pos.entry_price) * pos.quantity * direction
+                            pnl = (ltp - pos.entry_price) * pos.quantity
                             self.journal.close_candidate(
                                 trade_id=trade_id,
                                 exit_price=ltp,
@@ -1456,8 +1563,8 @@ class NiftyOptionsEngine:
                             )
                             # Record SL hit for re-entry cooldown
                             if exit_sig.reason.value in ("SL_HIT", "TRAILING_SL_HIT"):
-                                direction = "BUY" if pos.option_type == "CE" else "SELL"
-                                self.record_sl_hit(direction)
+                                sl_direction = "BUY" if pos.option_type == "CE" else "SELL"
+                                self.record_sl_hit(sl_direction)
 
             except Exception as e:
                 logger.error(f"Monitor error for {pos.symbol}: {e}")
@@ -1558,6 +1665,7 @@ class NiftyOptionsEngine:
     def run_cycle(self) -> Dict:
         """
         Main engine cycle. Returns dashboard state dict.
+        Enhanced: Multi-strategy, time-based and confluence-based switching.
         """
         self.init_day()
         self._cycle_count += 1
@@ -1573,7 +1681,6 @@ class NiftyOptionsEngine:
             if self.risk_mgr.open_positions:
                 logger.info("3:15 PM – auto square-off triggered")
                 self.square_off_all(kite, "SQUARED_OFF")
-            # Fetch offline data so dashboard still shows spot & candidates
             return self.fetch_offline_data()
 
         # -- Daily loss limit check --
@@ -1614,17 +1721,13 @@ class NiftyOptionsEngine:
                 return self.dashboard_state
 
         self.nifty_spot = df["close"].iloc[-1]
-
-        # -- Start Live OI Feed (once, after we have spot price) --
         self._start_oi_feed(kite)
 
-        # -- Fetch India VIX for safety filter --
         vix = self._fetch_india_vix(kite)
         if vix > settings.vix_max_threshold and vix > 0:
             logger.warning(f"India VIX {vix:.1f} > max threshold {settings.vix_max_threshold}. Skipping new trades.")
             self.dashboard_state["engine_status"] = "VIX_TOO_HIGH"
             self.dashboard_state["india_vix"] = vix
-            # Still monitor existing positions even when VIX is high
             try:
                 self.monitor_positions(kite)
             except Exception as e:
@@ -1635,25 +1738,17 @@ class NiftyOptionsEngine:
         # -- Compute indicators on spot data for candidate building --
         df = self.strategy.compute_supertrend(df)
         df = self.strategy.compute_macd(df)
-
-        # -- Gap-day classification (once per day, after ORB) --
         if self._gap_type == "NONE" and self._cycle_count <= 2:
             self._compute_gap_classification(df)
-
-        # -- Multi-timeframe Supertrend (15m + 1h) --
         if self._cycle_count <= 1 or self._cycle_count % 3 == 0:
-            # Refresh multi-TF every ~15 min (every 3 cycles)
             try:
                 self._fetch_multi_tf_data(kite)
             except Exception as e:
                 logger.debug(f"Multi-TF fetch error: {e}")
-
-        # -- Compute VWAP / CPR / S-R levels --
         self._cached_levels = self.level_calc.compute(
             df, orb_high=self.orb_high or 0, orb_low=self.orb_low or 0
         )
         self._cached_df = df
-
         st_dir = int(df.iloc[-1].get("st_dir", 1)) if "st_dir" in df.columns else 1
         macd_hist = float(df.iloc[-1].get("macd_hist", 0)) if "macd_hist" in df.columns else 0.0
         macd_hist_prev = float(df.iloc[-2].get("macd_hist", 0)) if len(df) > 1 and "macd_hist" in df.columns else 0.0
@@ -1662,50 +1757,228 @@ class NiftyOptionsEngine:
         except Exception:
             atr_val = 0.0
 
-        # -- Generate signal from ORB strategy (with OI data if available) --
-        # Prefer live OI from WebSocket feed over cached REST-fetched OI
-        live_oi = self._get_live_oi_data()
-        if live_oi:
-            self._cached_oi_data = live_oi
-            logger.debug(
-                f"Using live OI: PCR={live_oi.get('pcr', 0):.3f}, "
-                f"CE OI chg={live_oi.get('ce_oi_change_pct', 0):+.1f}%, "
-                f"PE OI chg={live_oi.get('pe_oi_change_pct', 0):+.1f}%"
+        # --- Multi-strategy switching logic ---
+        now = datetime.now().time()
+        orb_end = (datetime.combine(datetime.today(), time(9, 15)) + timedelta(minutes=settings.orb_minutes)).time()
+        supertrend_strategy = None
+        try:
+            from strategies.supertrend_strategy import SupertrendStrategy
+            supertrend_strategy = SupertrendStrategy()
+        except Exception:
+            pass
+
+        # --- Strategy selection ---
+        # ORB strategy runs ALL DAY (9:30–15:00) — it handles its own time guards.
+        # Other strategies run alongside after the ORB window for confluence.
+        signal = None
+        all_signals = []
+
+        # 1. ORB strategy — always active after 9:30 (strategy internally
+        #    rejects signals before ORB end and after 15:00)
+        try:
+            orb_signal = self.strategy.generate_signal(
+                df, "NIFTY", oi_data=self._cached_oi_data or None
             )
-        signal = self.strategy.generate_signal(df, "NIFTY", oi_data=self._cached_oi_data or None)
+            if orb_signal:
+                all_signals.append(orb_signal)
+        except Exception as e:
+            logger.warning(f"ORB signal error: {e}")
 
-        # -- Try VWAP mean reversion if ORB has no signal --
-        if signal is None and settings.enable_vwap_strategy:
-            try:
-                vwap_signal = self.vwap_strategy.generate_signal(
-                    df, "NIFTY",
-                    levels=self._cached_levels,
-                    orb_high=self.orb_high or 0,
-                    orb_low=self.orb_low or 0,
-                    india_vix=self._india_vix,
-                    gap_type=self._gap_type,
-                )
-                if vwap_signal:
-                    signal = vwap_signal
-                    logger.info(f"VWAP MR signal activated: {vwap_signal.signal.value}")
-            except Exception as e:
-                logger.debug(f"VWAP strategy error: {e}")
+        # 2. After ORB window, also try auxiliary strategies for confluence
+        if now > orb_end:
+            # Build option chain for premium-selling strategies
+            option_chain = None
+            spot = self.nifty_spot
+            if hasattr(self, "all_candidates") and self.all_candidates:
+                option_chain = [
+                    {
+                        "tradingsymbol": c.tradingsymbol,
+                        "strike": c.strike,
+                        "option_type": c.option_type,
+                        "ltp": c.ltp,
+                        "oi": getattr(c, "oi", 0),
+                        "lot_size": getattr(c, "quantity", 50),
+                    }
+                    for c in self.all_candidates
+                ]
 
-        # -- Try expiry premium sell if enabled and no signal yet --
-        if signal is None and settings.enable_expiry_sell_strategy:
-            try:
-                expiry_signal = self.expiry_strategy.generate_signal(
-                    df, "NIFTY",
-                    india_vix=self._india_vix,
-                    orb_high=self.orb_high or 0,
-                    orb_low=self.orb_low or 0,
-                    gap_type=self._gap_type,
-                )
-                if expiry_signal:
-                    signal = expiry_signal
-                    logger.info(f"Expiry sell signal activated")
-            except Exception as e:
-                logger.debug(f"Expiry strategy error: {e}")
+            # --- Directional strategies ---
+            if settings.enable_vwap_strategy:
+                try:
+                    s = self.vwap_strategy.generate_signal(
+                        df, "NIFTY", levels=self._cached_levels,
+                        orb_high=self.orb_high or 0, orb_low=self.orb_low or 0,
+                        india_vix=self._india_vix, gap_type=self._gap_type)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"VWAP MR error: {e}")
+
+            if settings.enable_vwap_breakout:
+                try:
+                    s = self.vwap_breakout_strategy.generate_signal(
+                        df, "NIFTY", orb_high=self.orb_high or 0, orb_low=self.orb_low or 0)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"VWAP Breakout error: {e}")
+
+            if settings.enable_ema_crossover:
+                try:
+                    s = self.ema_crossover_strategy.generate_signal(df, "NIFTY")
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"EMA Crossover error: {e}")
+
+            if settings.enable_rsi_divergence:
+                try:
+                    s = self.rsi_divergence_strategy.generate_signal(df, "NIFTY")
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"RSI Divergence error: {e}")
+
+            if settings.enable_pcr_oi_strategy:
+                try:
+                    oi_data = self._get_live_oi_data() or self._cached_oi_data
+                    s = self.pcr_oi_strategy.generate_signal(df, "NIFTY", oi_analysis=oi_data)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"PCR/OI error: {e}")
+
+            if settings.enable_gap_fill:
+                try:
+                    pdc = self._cached_levels.pdc if self._cached_levels else 0
+                    s = self.gap_fill_strategy.generate_signal(
+                        df, "NIFTY", gap_type=self._gap_type,
+                        gap_pct=self._gap_pct, prev_close=pdc)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Gap Fill error: {e}")
+
+            if supertrend_strategy:
+                try:
+                    s = supertrend_strategy.generate_signal(df, "NIFTY")
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Supertrend error: {e}")
+
+            # --- Range-bound / sideways strategies ---
+            if settings.enable_bollinger_mr:
+                try:
+                    s = self.bollinger_mr_strategy.generate_signal(df, "NIFTY")
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Bollinger MR error: {e}")
+
+            if settings.enable_orb_scalper:
+                try:
+                    s = self.orb_scalper_strategy.generate_signal(
+                        df, "NIFTY",
+                        orb_high=self.orb_high or 0,
+                        orb_low=self.orb_low or 0)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"ORB Range Scalper error: {e}")
+
+            # --- Premium selling strategies ---
+            if settings.enable_expiry_sell_strategy:
+                try:
+                    s = self.expiry_strategy.generate_signal(
+                        df, "NIFTY", india_vix=self._india_vix,
+                        orb_high=self.orb_high or 0, orb_low=self.orb_low or 0,
+                        gap_type=self._gap_type)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Expiry Sell error: {e}")
+
+            if settings.enable_straddle_strangle:
+                try:
+                    s = self.straddle_strategy.generate_signal(
+                        df, "NIFTY", india_vix=self._india_vix,
+                        orb_high=self.orb_high or 0, orb_low=self.orb_low or 0,
+                        option_chain=option_chain, spot=spot)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Straddle/Strangle error: {e}")
+
+            if settings.enable_iron_condor:
+                try:
+                    s = self.iron_condor_strategy.generate_signal(
+                        df, "NIFTY", india_vix=self._india_vix,
+                        orb_high=self.orb_high or 0, orb_low=self.orb_low or 0,
+                        option_chain=option_chain, spot=spot)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Iron Condor error: {e}")
+
+            # --- Hero Zero Expiry ---
+            if self.hero_zero_strategy and settings.enable_hero_zero:
+                try:
+                    s = self.hero_zero_strategy.generate_signal(
+                        df, "NIFTY", option_chain=option_chain, spot=spot)
+                    if s: all_signals.append(s)
+                except Exception as e:
+                    logger.debug(f"Hero Zero error: {e}")
+
+        # --- Market Regime Detection + Signal Selection ---
+        # Step 1: Detect if market is TRENDING, SIDEWAYS, VOLATILE, or BREAKOUT
+        regime = detect_regime(
+            df,
+            orb_high=self.orb_high or 0,
+            orb_low=self.orb_low or 0,
+            india_vix=self._india_vix,
+        )
+        logger.info(
+            f"Market Regime: {regime.regime.value} (conf={regime.confidence:.0f}%) | "
+            f"ADX={regime.adx} BBW={regime.bbw_pct}% ORB_contained={regime.orb_contained} "
+            f"ST_flips={regime.st_flips} | {regime.reasoning}"
+        )
+        self.dashboard_state["market_regime"] = {
+            "regime": regime.regime.value,
+            "confidence": regime.confidence,
+            "adx": regime.adx,
+            "bbw_pct": regime.bbw_pct,
+            "orb_contained": regime.orb_contained,
+            "st_flips": regime.st_flips,
+            "candle_ratio": regime.avg_candle_ratio,
+            "reasoning": regime.reasoning,
+        }
+
+        # Step 2: Filter signals — block strategies that don't fit the regime
+        # e.g., block mean-reversion in a trending market, block breakout in sideways
+        filtered_signals = filter_signals_by_regime(all_signals, regime)
+
+        # Step 3: Pick best signal from filtered list
+        # Confluence: if 2+ strategies agree on direction → higher conviction
+        buy_signals = [s for s in filtered_signals if getattr(s, "signal", None) == SignalType.BUY
+                       or getattr(s, "signal", None) == "BUY"]
+        sell_signals = [s for s in filtered_signals if getattr(s, "signal", None) == SignalType.SELL
+                        or getattr(s, "signal", None) == "SELL"]
+        if len(buy_signals) >= 2:
+            # Multiple strategies agree on BUY — pick highest confidence
+            signal = max(buy_signals, key=lambda s: getattr(s, "confidence", 0))
+            signal.confidence = min(95, signal.confidence + 5)  # Confluence bonus
+        elif len(sell_signals) >= 2:
+            signal = max(sell_signals, key=lambda s: getattr(s, "confidence", 0))
+            signal.confidence = min(95, signal.confidence + 5)
+        elif filtered_signals:
+            signal = max(filtered_signals, key=lambda s: getattr(s, "confidence", 0))
+
+        # Log all signals considered (before + after regime filter)
+        self.dashboard_state["all_signals"] = [
+            {
+                "type": s.signal.value,
+                "entry": s.entry_price,
+                "sl": s.stop_loss,
+                "target": s.target,
+                "confidence": s.confidence,
+                "conditions": s.conditions_met,
+                "reasoning": s.reasoning,
+                "strategy": getattr(s, "strategy_name", ""),
+                "time": s.timestamp,
+            } for s in all_signals
+        ]
+        self.dashboard_state["filtered_signals_count"] = len(filtered_signals)
+        self.dashboard_state["blocked_signals_count"] = len(all_signals) - len(filtered_signals)
+
 
         self.last_signal = signal
 
@@ -1778,10 +2051,19 @@ class NiftyOptionsEngine:
                     "atr": lvls.atr,
                 }
 
-            # Only alert once per unique signal direction+entry
-            sig_key = f"{signal.signal.value}@{round(signal.entry_price, 1)}"
+            # Only alert once per unique signal direction + entry (rounded to nearest 25 pts)
+            # This prevents near-identical signals (e.g., SELL@23717 vs SELL@23718) from
+            # spamming Telegram as separate "new" signals.
+            sig_key = f"{signal.signal.value}@{round(signal.entry_price / 25) * 25}"
             if sig_key != self._alerted_signal_key:
+                logger.info(f"New signal detected: {sig_key} | Entry: {signal.entry_price} | SL: {signal.stop_loss} | Target: {signal.target} | Confidence: {signal.confidence}")
                 self._alerted_signal_key = sig_key
+                # Include top candidate info if available
+                top_candidate = self.scored_candidates[0] if self.scored_candidates else None
+                option_strike = top_candidate.strike if top_candidate else None
+                option_type = top_candidate.option_type if top_candidate else None
+                option_expiry = top_candidate.expiry if top_candidate else None
+                option_symbol = top_candidate.tradingsymbol if top_candidate else None
                 telegram.alert_signal(
                     signal_type=signal.signal.value,
                     entry=signal.entry_price,
@@ -1790,6 +2072,11 @@ class NiftyOptionsEngine:
                     confidence=signal.confidence,
                     conditions=signal.conditions_met,
                     reasoning=signal.reasoning,
+                    option_strike=option_strike,
+                    option_type=option_type,
+                    option_expiry=option_expiry,
+                    option_symbol=option_symbol,
+                    strategy_name=getattr(signal, "strategy_name", ""),
                 )
 
             # Record signal & candidates in journal
@@ -1808,28 +2095,49 @@ class NiftyOptionsEngine:
                 self.journal.record_candidates(sig_id, self.scored_candidates)
 
             # Execute on top candidate(s) via auto order manager
-            if self.auto_trade_mode in ("paper", "live"):
+            # --- CRITICAL: Market-hour and execution control gate ---
+            skip_trade, skip_reason = should_skip_new_trades()
+            if skip_trade:
+                logger.warning(f"New trades blocked: {skip_reason}")
+                self.dashboard_state.setdefault("skipped_signals", []).append({
+                    "type": signal.signal.value,
+                    "entry": signal.entry_price,
+                    "reason": skip_reason,
+                    "confidence": signal.confidence,
+                    "time": signal.timestamp,
+                })
+                telegram.send_custom(f"🚫 New trades blocked: {skip_reason}")
+            elif self.auto_trade_mode in ("paper", "live"):
+                skip_reasons = []
                 # --- Safety filter: minimum confidence threshold ---
                 if signal.confidence < settings.min_confidence_threshold:
-                    logger.info(
-                        f"Signal confidence {signal.confidence:.0f}% < min threshold "
-                        f"{settings.min_confidence_threshold:.0f}%. Skipping trade execution."
-                    )
+                    skip_reasons.append(f"confidence {signal.confidence} < min threshold {settings.min_confidence_threshold}")
+                    logger.info(f"Trade skipped: {skip_reasons[-1]}")
                     telegram.send_message(
-                        f"⚠️ Signal skipped (low confidence {signal.confidence:.0f}% "
-                        f"< {settings.min_confidence_threshold:.0f}%)"
+                        f"⚠️ Signal skipped (low confidence {signal.confidence:.0f}% < {settings.min_confidence_threshold:.0f}%)"
                     )
                 # --- Safety filter: re-entry cooldown after SL hit ---
                 elif self._check_reentry_cooldown("BUY" if signal.signal == SignalType.BUY else "SELL"):
-                    logger.info("Re-entry cooldown active. Skipping trade execution.")
+                    skip_reasons.append(f"re-entry cooldown active for {signal.signal.value}")
+                    logger.info(f"Trade skipped: {skip_reasons[-1]}")
                     telegram.send_message(
-                        f"⏳ Signal skipped (re-entry cooldown after SL hit, "
-                        f"wait {settings.reentry_cooldown_minutes} min)"
+                        f"⏳ Signal skipped (re-entry cooldown after SL hit, wait {settings.reentry_cooldown_minutes} min)"
                     )
+                # --- Add more risk filters here as needed ---
+                if skip_reasons:
+                    # Track skipped/blocked signals for analytics
+                    self.dashboard_state.setdefault("skipped_signals", []).append({
+                        "type": signal.signal.value,
+                        "entry": signal.entry_price,
+                        "reason": ", ".join(skip_reasons),
+                        "confidence": signal.confidence,
+                        "time": signal.timestamp,
+                    })
                 else:
                     # --- VIX-based position size reduction ---
                     vix_size_factor = 1.0
                     if self._india_vix > settings.vix_reduce_size_threshold:
+                        logger.info(f"Trade size reduced: India VIX {self._india_vix} > threshold {settings.vix_reduce_size_threshold}")
                         vix_size_factor = 0.5
                         logger.info(
                             f"India VIX {self._india_vix:.1f} > {settings.vix_reduce_size_threshold}. "
@@ -1838,14 +2146,17 @@ class NiftyOptionsEngine:
 
                     for cand in self.scored_candidates:
                         if len(self.order_mgr.positions) >= self.risk_mgr.max_concurrent:
+                            logger.info(f"Trade skipped: max concurrent positions reached ({self.risk_mgr.max_concurrent})")
                             break
                         # Skip strikes already attempted this session
                         if cand.tradingsymbol in self._traded_strikes:
+                            logger.info(f"Trade skipped: {cand.tradingsymbol} already attempted this session")
                             continue
                         # Only execute if position is not already open for this symbol
                         existing = [p for p in self.order_mgr.positions.values()
                                     if p.symbol == cand.tradingsymbol and p.status != "CLOSED"]
                         if not existing:
+                            logger.info(f"Placing trade for {cand.tradingsymbol} | Entry: {cand.entry_price} | SL: {cand.stoploss} | Qty: {cand.quantity if hasattr(cand, 'quantity') else 'N/A'}")
                             self._traded_strikes.add(cand.tradingsymbol)
                             pos = self._execute_trade(kite, cand, qty_factor=vix_size_factor)
                             if pos:
@@ -1860,8 +2171,10 @@ class NiftyOptionsEngine:
             self.dashboard_state["engine_status"] = "MONITORING"
             self.dashboard_state["signal"] = None
 
-        # -- Send top candidates via Telegram every cycle --
-        if self.scored_candidates:
+        # -- Send top candidates via Telegram ONLY when signal is active --
+        # Previously this fired every cycle even before ORB capture,
+        # flooding Telegram with premature candidate alerts.
+        if signal is not None and self.scored_candidates and self._orb_captured:
             # Only alert candidates with strikes not already sent
             new_candidates = [
                 c for c in self.scored_candidates[:5]
@@ -1922,7 +2235,12 @@ class NiftyOptionsEngine:
         self.dashboard_state["nifty_spot"] = self.nifty_spot
         self.dashboard_state["cycle_count"] = self._cycle_count
         self.dashboard_state["auto_trade_mode"] = self.auto_trade_mode
-        self.dashboard_state["active_positions"] = self.order_mgr.get_active_positions()
+        active_positions = self.order_mgr.get_active_positions()
+        trades_today = self.risk_mgr.get_trades_summary()
+        logger.info(f"Dashboard update: {len(active_positions)} active positions, {len(trades_today)} trades today.")
+        logger.debug(f"Active positions: {active_positions}")
+        logger.debug(f"Trades today: {trades_today}")
+        self.dashboard_state["active_positions"] = active_positions
         self.dashboard_state["order_log"] = self.order_mgr.get_order_log()
         if self._cached_levels:
             lvls = self._cached_levels

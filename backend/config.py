@@ -73,11 +73,40 @@ class Settings(BaseSettings):
     instruments_to_trade: str = "NIFTY"      # comma-separated: "NIFTY,BANKNIFTY"
     banknifty_lot_size: int = 30
     banknifty_strike_gap: int = 100
+    finnifty_lot_size: int = 40
+    finnifty_strike_gap: int = 50
+    midcpnifty_lot_size: int = 75
+    midcpnifty_strike_gap: int = 25
+    sensex_lot_size: int = 20
+    sensex_strike_gap: int = 100
 
     # --- Strategy Toggles ---
-    enable_vwap_strategy: bool = False       # VWAP mean-reversion (range-bound days)
-    enable_expiry_sell_strategy: bool = False # Expiry premium selling
+    enable_vwap_strategy: bool = True        # VWAP mean-reversion (range-bound days)
+    enable_expiry_sell_strategy: bool = True  # Expiry premium selling
     vwap_range_bound_max_orb_pct: float = 0.5  # ORB range < 0.5% of spot = range-bound
+    enable_pcr_oi_strategy: bool = True      # PCR/OI directional
+    enable_vwap_breakout: bool = True        # VWAP band breakout (trending days)
+    enable_ema_crossover: bool = True        # EMA 9/21 crossover
+    enable_rsi_divergence: bool = True       # RSI divergence reversal
+    enable_gap_fill: bool = True             # Gap fill strategy
+    enable_straddle_strangle: bool = False   # Straddle/Strangle sell (needs margin)
+    enable_iron_condor: bool = False         # Iron Condor (needs margin + multi-leg)
+    enable_hero_zero: bool = True            # Hero Zero expiry lottery
+    enable_bollinger_mr: bool = True         # Bollinger Band mean reversion (sideways)
+    enable_orb_scalper: bool = True          # ORB range scalper (sideways days)
+
+    # --- Adaptive Risk ---
+    enable_adaptive_sizing: bool = False     # Auto-adjust position size
+    adaptive_lookback_trades: int = 5        # Look at last N trades for win rate
+    adaptive_min_win_rate: float = 40.0      # Reduce size below this win rate
+    adaptive_max_win_rate: float = 70.0      # Increase size above this win rate
+    adaptive_reduce_factor: float = 0.5      # Multiply qty by this when losing
+    adaptive_increase_factor: float = 1.25   # Multiply qty by this when winning
+    adaptive_drawdown_halt_pct: float = 3.0  # Halt trading at this daily loss %
+
+    # --- Stock F&O ---
+    stock_fno_enabled: bool = False
+    stock_fno_watchlist: str = "RELIANCE,TCS,HDFCBANK,ICICIBANK,INFY"
 
     # --- Multi-Timeframe ---
     enable_multi_tf: bool = True             # use 15m + 1h confirmation
@@ -112,6 +141,10 @@ class Settings(BaseSettings):
     # --- Telegram Alerts ---
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+
+    # --- API Security (protect trading endpoints) ---
+    # Set this in `.env` as API_KEY="<long-random-string>"
+    api_key: str = ""
 
     @property
     def cors_origins_list(self) -> List[str]:

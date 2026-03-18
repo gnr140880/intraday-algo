@@ -128,47 +128,22 @@ class TrailingSLManager:
         # --- Compute TSL candidates from different methods ---
         tsl_candidates = []
 
-        # Method 1: Phase-based fixed floors
+        # Method 1: Phase-based fixed floors (strict as per user logic)
         if new_phase == "BREAKEVEN":
             # Lock breakeven: SL at entry price (cost-to-cost)
-            floor = entry_price
-            tsl_candidates.append(floor)
-
-        elif new_phase == "TRAIL_T1":
-            # Floor at entry price (never go below breakeven once T1 hit)
             tsl_candidates.append(entry_price)
 
-            # ATR-based trail from watermark
-            atr_tsl = new_highest - option_atr * cfg.trail_t1_atr_mult
-            tsl_candidates.append(atr_tsl)
-
-            # Percentage-based trail from watermark
-            pct_tsl = new_highest * (1 - cfg.trail_pct_initial / 100)
-            tsl_candidates.append(pct_tsl)
+        elif new_phase == "TRAIL_T1":
+            # SL moves to entry (never below entry after T1)
+            tsl_candidates.append(entry_price)
 
         elif new_phase == "TRAIL_T2":
-            # Floor at T1 level (never below T1 once T2 is hit)
+            # SL moves to T1 (never below T1 after T2)
             tsl_candidates.append(target1)
 
-            # ATR-based trail (tighter)
-            atr_tsl = new_highest - option_atr * cfg.trail_t2_atr_mult
-            tsl_candidates.append(atr_tsl)
-
-            # Percentage-based trail (tighter)
-            pct_tsl = new_highest * (1 - cfg.trail_pct_t2 / 100)
-            tsl_candidates.append(pct_tsl)
-
         elif new_phase == "TIGHT":
-            # Floor at T2 level (never below T2 once in tight phase)
+            # SL moves to T2 (never below T2 after T3/tight phase)
             tsl_candidates.append(target2)
-
-            # Very tight ATR trail
-            atr_tsl = new_highest - option_atr * cfg.tight_atr_mult
-            tsl_candidates.append(atr_tsl)
-
-            # Very tight percentage trail
-            pct_tsl = new_highest * (1 - cfg.trail_pct_tight / 100)
-            tsl_candidates.append(pct_tsl)
 
         # Method 2: Swing-low based (use lowest low of last N candles mapped to option)
         if df is not None and len(df) >= cfg.swing_lookback_candles and new_phase not in ("INITIAL",):
@@ -180,7 +155,7 @@ class TrailingSLManager:
 
         # Method 3: Supertrend line as trailing SL (if available and trade is winning)
         if df is not None and new_phase not in ("INITIAL",):
-            st_tsl = self._compute_supertrend_tsl(df, entry_price, delta)
+            st_tsl = self._compute_supertrend_tsl(df, current_ltp, entry_price, delta)
             if st_tsl > 0:
                 tsl_candidates.append(st_tsl)
 
@@ -256,6 +231,7 @@ class TrailingSLManager:
     def _compute_supertrend_tsl(
         self,
         df: pd.DataFrame,
+        current_ltp: float,
         entry_price: float,
         delta: float,
     ) -> float:
@@ -288,14 +264,11 @@ class TrailingSLManager:
             d = abs(delta) if delta > 0 else 0.4
             # Map: if spot drops to ST line, option would lose spot_buffer * delta
             option_drop = spot_buffer * d
-            tsl = entry_price  # At minimum, if spot @ ST line, we're roughly at entry
-            # Actually compute more precisely:
-            # current_option ≈ entry + (current_spot - entry_spot) * delta  (approx)
-            # if spot drops to ST: option ≈ entry + (ST - entry_spot) * delta
-            # So TSL ≈ current_option - option_drop
-            # But we don't have entry_spot here, so use a simpler heuristic:
-            # TSL = max(entry, current_option - option_drop) — protect at least breakeven
-            return max(entry_price, 0)
+            if current_ltp <= 0:
+                return 0.0
+            # If spot pulls back to the ST line, approximate option premium floor.
+            option_floor = current_ltp - option_drop
+            return max(entry_price, option_floor)
 
         return 0.0
 

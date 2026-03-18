@@ -40,86 +40,52 @@ class KiteClient:
     def get_login_url(self) -> str:
         return self.kite.login_url()
 
-    # ----------------------------------------------------------
-    # Automatic token refresh on TokenException
-    # ----------------------------------------------------------
-    def _call_with_refresh(self, fn, *args, **kwargs):
-        """Call a Kite API function. Auto-refresh disabled — raises TokenException directly."""
-        return fn(*args, **kwargs)
 
     def generate_session(self, request_token: str) -> Dict:
         try:
-            logger.info(
-                "generate_session called with: api_key='%s', api_secret='%s...' (len=%d), request_token='%s'",
-                self.kite.api_key,
-                settings.kite_api_secret[:6],
-                len(settings.kite_api_secret),
-                request_token,
-            )
+            logger.info("generate_session called")
             data = self.kite.generate_session(
                 request_token, api_secret=settings.kite_api_secret
             )
             self.access_token = data["access_token"]
             self.kite.set_access_token(self.access_token)
             self._connected = True
-
-            # Persist token to .env
-            self._update_env_token(self.access_token)
             logger.info("Session generated successfully")
             return {"success": True, "access_token": self.access_token}
         except Exception as e:
             logger.error(f"Session generation failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def _update_env_token(self, token: str):
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
-        lines = []
-        token_found = False
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                lines = f.readlines()
-            new_lines = []
-            for line in lines:
-                if line.startswith("KITE_ACCESS_TOKEN="):
-                    new_lines.append(f"KITE_ACCESS_TOKEN={token}\n")
-                    token_found = True
-                else:
-                    new_lines.append(line)
-            if not token_found:
-                new_lines.append(f"KITE_ACCESS_TOKEN={token}\n")
-            with open(env_path, "w") as f:
-                f.writelines(new_lines)
-
     @property
     def is_connected(self) -> bool:
         return self._connected and bool(self.access_token)
 
     def get_profile(self) -> Dict:
-        return self._call_with_refresh(self.kite.profile)
+        return self.kite.profile()
 
     def get_holdings(self) -> List[Dict]:
-        return self._call_with_refresh(self.kite.holdings)
+        return self.kite.holdings()
 
     def get_positions(self) -> Dict:
-        return self._call_with_refresh(self.kite.positions)
+        return self.kite.positions()
 
     def get_orders(self) -> List[Dict]:
-        return self._call_with_refresh(self.kite.orders)
+        return self.kite.orders()
 
     def get_trades(self) -> List[Dict]:
-        return self._call_with_refresh(self.kite.trades)
+        return self.kite.trades()
 
     def get_funds(self) -> Dict:
-        return self._call_with_refresh(self.kite.margins)
+        return self.kite.margins()
 
     def get_quote(self, instruments: List[str]) -> Dict:
-        return self._call_with_refresh(self.kite.quote, *instruments)
+        return self.kite.quote(*instruments)
 
     def get_ohlc(self, instruments: List[str]) -> Dict:
-        return self._call_with_refresh(self.kite.ohlc, *instruments)
+        return self.kite.ohlc(*instruments)
 
     def get_ltp(self, instruments: List[str]) -> Dict:
-        return self._call_with_refresh(self.kite.ltp, *instruments)
+        return self.kite.ltp(*instruments)
 
     def get_historical_data(
         self,
@@ -130,15 +96,14 @@ class KiteClient:
         continuous: bool = False,
         oi: bool = False,
     ) -> List[Dict]:
-        return self._call_with_refresh(
-            self.kite.historical_data,
+        return self.kite.historical_data(
             instrument_token, from_date, to_date, interval, continuous, oi
         )
 
     def get_instruments(self, exchange: str = None) -> List[Dict]:
         if exchange:
-            return self._call_with_refresh(self.kite.instruments, exchange)
-        return self._call_with_refresh(self.kite.instruments)
+            return self.kite.instruments(exchange)
+        return self.kite.instruments()
 
     def place_order(
         self,

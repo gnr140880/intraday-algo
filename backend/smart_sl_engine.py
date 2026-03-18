@@ -167,54 +167,14 @@ class SmartSLEngine:
 
         risk = entry - sl
 
-        # -- Find targets from structural resistances --
-        targets_raw = levels.get_buy_target_levels(entry)
-        t1, t1_type = 0.0, ""
-        t2, t2_type = 0.0, ""
-        t3, t3_type = 0.0, ""
 
-        # T1: first resistance that gives at least 1.5:1 R:R
-        min_t1 = entry + risk * self.target_min_rr
-        for lvl in targets_raw:
-            if lvl >= min_t1:
-                t1 = round(lvl, 2)
-                t1_type = _label_for_level(lvl, levels)
-                break
-
-        if t1 <= 0:
-            t1 = round(entry + risk * self.target_min_rr, 2)
-            t1_type = f"RR×{self.target_min_rr}"
-
-        # T2: next resistance beyond T1 (or 2.5:1 R:R)
-        min_t2 = t1 + risk * 0.3  # at least T1 + 0.3×risk gap
-        for lvl in targets_raw:
-            if lvl >= min_t2:
-                t2 = round(lvl, 2)
-                t2_type = _label_for_level(lvl, levels)
-                break
-        if t2 <= 0:
-            t2 = round(entry + risk * 2.5, 2)
-            t2_type = "RR×2.5"
-
-        # T3: next resistance beyond T2 (or 3.5:1 R:R)
-        min_t3 = t2 + risk * 0.3
-        for lvl in targets_raw:
-            if lvl >= min_t3:
-                t3 = round(lvl, 2)
-                t3_type = _label_for_level(lvl, levels)
-                break
-        if t3 <= 0:
-            t3 = round(entry + risk * 3.5, 2)
-            t3_type = "RR×3.5"
-
-        # Ensure targets are in ascending order (T1 nearest, T3 furthest)
-        t_list = sorted(
-            [(t1, t1_type), (t2, t2_type), (t3, t3_type)],
-            key=lambda x: x[0],
-        )
-        t1, t1_type = t_list[0]
-        t2, t2_type = t_list[1]
-        t3, t3_type = t_list[2]
+        # -- Find targets at 1:1, 2:1, 3:1 R:R --
+        t1 = round(entry + risk * 1, 2)
+        t2 = round(entry + risk * 2, 2)
+        t3 = round(entry + risk * 3, 2)
+        t1_type = "RR×1.0"
+        t2_type = "RR×2.0"
+        t3_type = "RR×3.0"
 
         # Trailing SL starts at SL, moves to breakeven when T1 hit
         trailing_sl = sl
@@ -272,51 +232,14 @@ class SmartSLEngine:
 
         risk = sl - entry
 
-        # -- Targets from structural supports --
-        targets_raw = levels.get_sell_target_levels(entry)
-        t1, t1_type = 0.0, ""
-        t2, t2_type = 0.0, ""
-        t3, t3_type = 0.0, ""
 
-        min_t1 = entry - risk * self.target_min_rr
-        for lvl in targets_raw:
-            if lvl <= min_t1:
-                t1 = round(lvl, 2)
-                t1_type = _label_for_level(lvl, levels)
-                break
-        if t1 <= 0:
-            t1 = round(entry - risk * self.target_min_rr, 2)
-            t1_type = f"RR×{self.target_min_rr}"
-
-        min_t2 = t1 - risk * 0.3
-        for lvl in targets_raw:
-            if lvl <= min_t2:
-                t2 = round(lvl, 2)
-                t2_type = _label_for_level(lvl, levels)
-                break
-        if t2 <= 0:
-            t2 = round(entry - risk * 2.5, 2)
-            t2_type = "RR×2.5"
-
-        min_t3 = t2 - risk * 0.3
-        for lvl in targets_raw:
-            if lvl <= min_t3:
-                t3 = round(lvl, 2)
-                t3_type = _label_for_level(lvl, levels)
-                break
-        if t3 <= 0:
-            t3 = round(entry - risk * 3.5, 2)
-            t3_type = "RR×3.5"
-
-        # Ensure targets are in descending order (T1 nearest, T3 furthest below entry)
-        t_list = sorted(
-            [(t1, t1_type), (t2, t2_type), (t3, t3_type)],
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        t1, t1_type = t_list[0]
-        t2, t2_type = t_list[1]
-        t3, t3_type = t_list[2]
+        # -- Find targets at 1:1, 2:1, 3:1 R:R --
+        t1 = round(entry - risk * 1, 2)
+        t2 = round(entry - risk * 2, 2)
+        t3 = round(entry - risk * 3, 2)
+        t1_type = "RR×1.0"
+        t2_type = "RR×2.0"
+        t3_type = "RR×3.0"
 
         trailing_sl = sl
         reward = entry - t1

@@ -64,6 +64,10 @@ class RiskManager:
         self._trading_halted: bool = False
         self._last_reset_date: Optional[date] = None
 
+        # Equity curve tracking
+        self._equity_curve: List[Dict] = []  # [{"time": iso, "equity": float, "pnl": float}]
+        self._trade_results: List[Dict] = []  # Recent trade results for adaptive sizing
+
     # ------------------------------------------------------------------
     # Daily reset
     # ------------------------------------------------------------------
@@ -187,6 +191,20 @@ class RiskManager:
         self.realised_pnl += trade.pnl
         self.daily_pnl = self.realised_pnl + self.unrealised_pnl
 
+        # Track for equity curve and adaptive sizing
+        self._equity_curve.append({
+            "time": trade.exit_time,
+            "equity": self.capital + self.realised_pnl,
+            "pnl": trade.pnl,
+            "daily_pnl": self.daily_pnl,
+        })
+        self._trade_results.append({
+            "trade_id": trade_id,
+            "pnl": trade.pnl,
+            "win": trade.pnl > 0,
+            "time": trade.exit_time,
+        })
+
         logger.info(
             f"Trade closed: {trade_id} exit={exit_price} pnl={trade.pnl:.2f} "
             f"reason={reason} daily_pnl={self.daily_pnl:.2f}"
@@ -277,3 +295,67 @@ class RiskManager:
             }
             for t in self.trades
         ]
+
+    # ------------------------------------------------------------------
+    # Adaptive position sizing
+    # ------------------------------------------------------------------
+    def get_adaptive_size_multiplier(
+        self,
+        lookback: int = 5,
+        min_win_rate: float = 40.0,
+        max_win_rate: float = 70.0,
+        reduce_factor: float = 0.5,
+        increase_factor: float = 1.25,
+        drawdown_halt_pct: float = 3.0,
+    ) -> float:
+        """
+        Returns a multiplier (0.0 to 1.25) for position sizing based on
+        recent trade performance.
+
+        - Win rate < min_win_rate → reduce by reduce_factor
+        - Win rate > max_win_rate → increase by increase_factor
+        - Daily drawdown > drawdown_halt_pct → return 0 (halt)
+        - Otherwise → 1.0 (normal)
+        """
+        # Check daily drawdown
+        if self.capital > 0:
+            dd_pct = abs(min(0, self.daily_pnl)) / self.capital * 100
+            if dd_pct >= drawdown_halt_pct:
+                logger.warning(f"Adaptive sizing: daily drawdown {dd_pct:.1f}% >= {drawdown_halt_pct}% — halting")
+                return 0.0
+
+        # Check recent win rate
+        recent = self._trade_results[-lookback:] if self._trade_results else []
+        if len(recent) < 3:
+            return 1.0  # Not enough data
+
+        wins = sum(1 for t in recent if t["win"])
+        win_rate = wins / len(recent) * 100
+
+        if win_rate < min_win_rate:
+            logger.info(f"Adaptive sizing: win rate {win_rate:.0f}% < {min_win_rate}% → reducing to {reduce_factor}x")
+            return reduce_factor
+        elif win_rate > max_win_rate:
+            logger.info(f"Adaptive sizing: win rate {win_rate:.0f}% > {max_win_rate}% → increasing to {increase_factor}x")
+            return increase_factor
+        return 1.0
+
+    def get_equity_curve(self) -> List[Dict]:
+        """Return the equity curve data for dashboard."""
+        return self._equity_curve
+
+    def get_recent_trade_stats(self, lookback: int = 20) -> Dict:
+        """Return recent trade statistics."""
+        recent = self._trade_results[-lookback:] if self._trade_results else []
+        if not recent:
+            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "avg_pnl": 0}
+        wins = sum(1 for t in recent if t["win"])
+        losses = len(recent) - wins
+        avg_pnl = sum(t["pnl"] for t in recent) / len(recent)
+        return {
+            "total": len(recent),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(recent) * 100, 1),
+            "avg_pnl": round(avg_pnl, 2),
+        }

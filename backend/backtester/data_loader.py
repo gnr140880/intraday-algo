@@ -26,7 +26,7 @@ class DataLoader:
         self,
         days: int = 90,
         interval: str = "5minute",
-        source: str = "yfinance",
+        source: str = "kite",
     ) -> Optional[pd.DataFrame]:
         """
         Load NIFTY spot historical data.
@@ -34,14 +34,22 @@ class DataLoader:
         Args:
             days: number of trading days to load
             interval: candle interval (5minute, 15minute, hour, day)
-            source: data source (yfinance, kite, csv)
+            source: data source (kite, yfinance, csv)
+                    Default is "kite" (Zerodha historical API).
+                    Falls back to yfinance if Kite is unavailable.
         """
-        if source == "yfinance":
+        if source == "kite":
+            df = self._load_from_kite(days, interval)
+            if df is not None and not df.empty:
+                # Auto-cache to CSV for offline use
+                self.save_to_csv(df, "NIFTY", interval)
+                return df
+            logger.info("Kite historical unavailable, falling back to yfinance")
+            return self._load_from_yfinance(days, interval)
+        elif source == "yfinance":
             return self._load_from_yfinance(days, interval)
         elif source == "csv":
             return self._load_from_csv("NIFTY", interval)
-        elif source == "kite":
-            return self._load_from_kite(days, interval)
         return None
 
     def _load_from_yfinance(
@@ -126,7 +134,16 @@ class DataLoader:
     def _load_from_kite(
         self, days: int, interval: str
     ) -> Optional[pd.DataFrame]:
-        """Load from Kite API (requires active session)."""
+        """Load from Kite API (requires active session). Enforces Kite interval limits."""
+        # Kite historical interval limits (calendar days)
+        interval_max_days = {
+            "minute": 60, "3minute": 100, "5minute": 100, "10minute": 100,
+            "15minute": 200, "30minute": 200, "60minute": 400, "hour": 400,
+            "day": 2000,
+        }
+        max_days = interval_max_days.get(interval, 60)
+        clamped_days = min(days, max_days)
+
         try:
             from kite_client import KiteClient
             kite = KiteClient.get_instance()
@@ -134,27 +151,68 @@ class DataLoader:
                 logger.warning("Kite not connected for historical data")
                 return None
 
-            # Resolve NIFTY token
-            instruments = kite.get_instruments("NSE")
-            token = None
-            for inst in instruments:
-                if inst["tradingsymbol"] == "NIFTY 50":
-                    token = inst["instrument_token"]
-                    break
-
-            if token is None:
-                return None
+            # NIFTY 50 token
+            token = 256265
 
             to_dt = datetime.now()
-            from_dt = to_dt - timedelta(days=days)
+            from_dt = to_dt - timedelta(days=clamped_days)
             raw = kite.get_historical_data(token, from_dt, to_dt, interval)
             if raw:
                 df = pd.DataFrame(raw)
-                logger.info(f"Loaded {len(df)} candles from Kite ({interval}, {days}d)")
+                logger.info(f"Loaded {len(df)} candles from Kite ({interval}, {clamped_days}d)")
                 return df
             return None
         except Exception as e:
             logger.error(f"Kite historical load failed: {e}")
+            return None
+
+    def load_instrument_history(
+        self,
+        instrument_token: int,
+        days: int = 30,
+        interval: str = "5minute",
+        oi: bool = False,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load historical data for any instrument token from Kite.
+        Falls back to None if Kite unavailable.
+        
+        Args:
+            instrument_token: Kite instrument token
+            days: calendar days of data
+            interval: candle interval
+            oi: include OI data (for F&O instruments)
+        """
+        interval_max_days = {
+            "minute": 60, "3minute": 100, "5minute": 100, "10minute": 100,
+            "15minute": 200, "30minute": 200, "60minute": 400, "hour": 400,
+            "day": 2000,
+        }
+        max_days = interval_max_days.get(interval, 60)
+        clamped_days = min(days, max_days)
+
+        try:
+            from kite_client import KiteClient
+            kite = KiteClient.get_instance()
+            if not kite.is_connected:
+                logger.warning("Kite not connected for historical data")
+                return None
+
+            to_dt = datetime.now()
+            from_dt = to_dt - timedelta(days=clamped_days)
+            raw = kite.get_historical_data(
+                instrument_token, from_dt, to_dt, interval, oi=oi
+            )
+            if raw:
+                df = pd.DataFrame(raw)
+                logger.info(
+                    f"Loaded {len(df)} candles for token {instrument_token} "
+                    f"from Kite ({interval}, {clamped_days}d)"
+                )
+                return df
+            return None
+        except Exception as e:
+            logger.error(f"Kite instrument history load failed: {e}")
             return None
 
     def save_to_csv(

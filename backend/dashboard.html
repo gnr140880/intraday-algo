@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NIFTY Options Engine – Live Dashboard</title>
+<style>
+  :root { --bg: #0f1117; --card: #1a1d29; --accent: #3b82f6; --green: #22c55e;
+           --red: #ef4444; --yellow: #eab308; --text: #e2e8f0; --muted: #94a3b8; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg);
+         color: var(--text); padding: 16px; }
+  h1 { font-size: 1.4rem; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+          gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--card); border-radius: 10px; padding: 16px; }
+  .card h2 { font-size: 1rem; color: var(--muted); margin-bottom: 8px; }
+  .stat { font-size: 2rem; font-weight: 700; }
+  .stat.green { color: var(--green); }
+  .stat.red { color: var(--red); }
+  .stat.yellow { color: var(--yellow); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+           font-size: 0.75rem; font-weight: 600; }
+  .badge-green { background: #22c55e33; color: var(--green); }
+  .badge-red { background: #ef444433; color: var(--red); }
+  .badge-yellow { background: #eab30833; color: var(--yellow); }
+  .badge-blue { background: #3b82f633; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; color: var(--muted); padding: 6px; border-bottom: 1px solid #2a2d3a; }
+  td { padding: 6px; border-bottom: 1px solid #1f2233; }
+  .bar-bg { background: #2a2d3a; border-radius: 4px; height: 8px; width: 100%; }
+  .bar-fill { height: 8px; border-radius: 4px; background: var(--accent); }
+  .pnl-bar { height: 4px; border-radius: 2px; margin-top: 4px; }
+  .meta { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+  #status-dot { width: 10px; height: 10px; border-radius: 50%;
+                display: inline-block; margin-right: 6px; }
+  .connected { background: var(--green); }
+  .disconnected { background: var(--red); }
+  .flex { display: flex; align-items: center; gap: 8px; }
+  .conditions li { font-size: 0.8rem; color: var(--muted); margin: 2px 0; }
+  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px;
+           border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { opacity: 0.85; }
+  button.danger { background: var(--red); }
+  a.kite-chart-link { color: var(--accent); text-decoration: none; font-weight: 700;
+    cursor: pointer; transition: color 0.15s; }
+  a.kite-chart-link:hover { color: #60a5fa; text-decoration: underline; }
+  .news-section { margin-top: 16px; }
+  .news-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .news-tab { background: var(--card); color: var(--muted); border: 1px solid #2a2d3a;
+              padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+  .news-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .news-list { max-height: 440px; overflow-y: auto; }
+  .news-item { padding: 10px 0; border-bottom: 1px solid #1f2233; }
+  .news-item:last-child { border-bottom: none; }
+  .news-title { font-size: 0.9rem; font-weight: 600; margin-bottom: 3px; }
+  .news-title a { color: var(--text); text-decoration: none; }
+  .news-title a:hover { color: var(--accent); }
+  .news-summary { font-size: 0.78rem; color: var(--muted); line-height: 1.4;
+                  max-height: 2.8em; overflow: hidden; }
+  .news-meta { font-size: 0.7rem; color: #64748b; margin-top: 3px; display: flex; gap: 10px; }
+  .sentiment-bar { display: flex; gap: 12px; align-items: center; margin: 4px 0 8px; }
+  .mood-chip { padding: 4px 12px; border-radius: 12px; font-size: 0.85rem; font-weight: 700; }
+  .mood-BULLISH { background: #22c55e22; color: var(--green); }
+  .mood-BEARISH { background: #ef444422; color: var(--red); }
+  .mood-NEUTRAL { background: #eab30822; color: var(--yellow); }
+  /* Historical Data section */
+  .hist-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .hist-ctrl-group { display: flex; flex-direction: column; gap: 3px; position: relative; }
+  .hist-ctrl-group label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .hist-ctrl-group select, .hist-ctrl-group input[type="text"], .hist-ctrl-group input[type="date"] {
+    background: #2a2d3a; color: var(--text); border: 1px solid #3a3d4a; border-radius: 5px;
+    padding: 6px 10px; font-size: 0.82rem; outline: none; min-width: 120px; }
+  .hist-ctrl-group select:focus, .hist-ctrl-group input:focus { border-color: var(--accent); }
+  .hist-btn-group { display: flex; gap: 4px; margin-top: 8px; }
+  .hist-period-btn { background: #2a2d3a; color: var(--muted); border: 1px solid #3a3d4a;
+    padding: 4px 12px; border-radius: 5px; cursor: pointer; font-size: 0.78rem; transition: all 0.15s; }
+  .hist-period-btn:hover { border-color: var(--accent); color: var(--text); }
+  .hist-period-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="flex" style="justify-content: space-between; margin-bottom: 12px;">
+  <h1>🎯 NIFTY Options Engine</h1>
+  <div class="flex">
+    <span id="status-dot" class="disconnected"></span>
+    <span id="ws-status">Disconnected</span>
+    <button onclick="runCycle()">Run Cycle</button>
+    <button class="danger" onclick="squareOff()">Square Off All</button>
+  </div>
+</div>
+
+<div id="offline-bar" style="display:none; align-items:center; gap:12px; padding:8px 16px; margin-bottom:12px; background:#1a1a2e; border:1px solid #ffd700; border-radius:8px;">
+  <span class="offline-label" style="color:#ffd700; font-weight:600;">🌙 Market Closed</span>
+  <button id="offline-btn" onclick="fetchOfflineData()" style="margin-left:auto; background:#ffd700; color:#0a0a1a; border:none; padding:6px 14px; border-radius:6px; cursor:pointer; font-weight:600;">🔄 Fetch Offline Data</button>
+</div>
+
+<!-- Row 1: Key metrics -->
+<div class="grid">
+  <div class="card">
+    <h2>Engine Status</h2>
+    <div class="stat" id="engine-status">IDLE</div>
+    <div class="meta" id="last-update">—</div>
+  </div>
+  <div class="card">
+    <h2>NIFTY Spot</h2>
+    <div class="stat" id="nifty-spot">—</div>
+    <div class="meta" id="orb-range">ORB: —</div>
+  </div>
+  <div class="card">
+    <h2>Daily P&L</h2>
+    <div class="stat" id="daily-pnl">₹0</div>
+    <div class="meta" id="pnl-detail">Realised: — | Unrealised: —</div>
+    <div class="bar-bg"><div class="pnl-bar" id="pnl-bar" style="width:0;background:var(--green)"></div></div>
+  </div>
+  <div class="card">
+    <h2>Open Positions</h2>
+    <div class="stat" id="open-pos">0</div>
+    <div class="meta" id="trades-count">Trades today: 0</div>
+  </div>
+  <div class="card">
+    <h2>OI Analysis</h2>
+    <div style="display:flex;gap:16px;align-items:baseline;">
+      <div><span style="font-size:0.8rem;color:var(--muted)">CE OI:</span> <span class="stat" style="font-size:1.5rem" id="ce-oi-chg">—</span></div>
+      <div><span style="font-size:0.8rem;color:var(--muted)">PE OI:</span> <span class="stat" style="font-size:1.5rem" id="pe-oi-chg">—</span></div>
+    </div>
+    <div class="meta" id="oi-interpretation">OI change % vs previous day (ATM ± 3 strikes)</div>
+  </div>
+  <div class="card">
+    <h2>Safety Filters</h2>
+    <div style="font-size:0.85rem;">
+      <div style="margin-bottom:4px;">VIX: <b id="sf-vix">—</b> <span id="sf-vix-status" class="badge badge-green">OK</span></div>
+      <div style="margin-bottom:4px;">Gap: <b id="sf-gap">NONE</b></div>
+      <div style="margin-bottom:4px;">Multi-TF: 15m=<b id="sf-st15m">—</b> 1h=<b id="sf-st1h">—</b></div>
+      <div style="margin-bottom:4px;">Strategies: <span id="sf-strategies">ORB</span></div>
+    </div>
+    <div class="meta">Orders: <span id="sf-orders">0</span>/<span id="sf-orders-max">10</span></div>
+  </div>
+</div>
+
+<!-- Row 2: Signal + Top Scores -->
+<div class="grid">
+  <div class="card">
+    <h2>Active Signal</h2>
+    <div id="signal-box">
+      <span class="badge badge-blue">NO SIGNAL</span>
+    </div>
+    <ul class="conditions" id="conditions-list"></ul>
+    <div class="meta" style="margin-top:8px; color:#aaa; font-size:0.95em;">
+      <b>Note:</b> "Active Signal" means a trade opportunity is detected by the strategy. Whether an order is actually placed depends on auto-trading settings and risk filters. Check "Open Positions" to confirm if a trade is live.
+    </div>
+  </div>
+  <div class="card" style="grid-column: span 2;">
+    <h2>Top Scored Candidates (Top 10%)</h2>
+    <table>
+      <thead>
+        <tr><th>Option 📈</th><th>Type</th><th>Entry</th><th>SL</th><th>TGT 1</th><th>TGT 2</th><th>TGT 3</th><th>R:R%</th><th>Score</th><th>OI Chg%</th><th>OI Signal</th><th>Expiry</th></tr>
+      </thead>
+      <tbody id="scores-body"></tbody>
+    </table>
+    <div class="meta" id="score-meta">—</div>
+    <div class="meta" style="margin-top:8px; color:#aaa; font-size:0.95em;">
+      <b>Note:</b> "Top Scored Candidates" are for the current signal direction (SELL = shorting options, BUY = buying options). The system recommends selling Put Options (PE) or Call Options (CE) based on the detected signal.
+    </div>
+  </div>
+</div>
+
+<!-- Row 3: Trade log -->
+<div class="card">
+  <h2>Trades Today</h2>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Symbol</th><th>Type</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Score</th><th>Status</th></tr>
+    </thead>
+    <tbody id="trades-body"></tbody>
+  </table>
+</div>
+
+<!-- Row 3.2: Active Auto-Managed Positions with Trailing SL -->
+<div class="card" style="margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2>🎯 Active Positions – Trailing SL</h2>
+    <button onclick="loadActivePositions()" style="font-size:0.75rem;padding:4px 10px;">⟳ Refresh</button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Type</th><th>Entry</th><th>Qty</th>
+        <th>Init SL</th><th>Trailing SL</th><th>Phase</th><th>Watermark</th>
+        <th>T1</th><th>T2</th><th>T3</th>
+        <th>Targets Hit</th><th>Last TSL Update</th>
+      </tr>
+    </thead>
+    <tbody id="auto-pos-body"></tbody>
+  </table>
+  <div class="meta" id="auto-pos-meta" style="margin-top:6px;">Click "Refresh" or positions update automatically.</div>
+</div>
+
+<!-- Row 3.5: EOD Trade Journal -->
+<div class="card" id="eod-section" style="margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <h2>📋 EOD Trade Journal</h2>
+    <div style="display:flex;gap:8px;">
+      <button onclick="fetchEODReport()" style="font-size:0.75rem;padding:4px 10px;">📊 Load Report</button>
+      <button onclick="sendEODTelegram()" style="font-size:0.75rem;padding:4px 10px;background:var(--green);">📲 Send to Telegram</button>
+    </div>
+  </div>
+  <div id="eod-summary" style="display:none;margin-top:10px;">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:12px;">
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Signals</div><div class="stat" style="font-size:1.4rem;" id="eod-signals">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Candidates</div><div class="stat" style="font-size:1.4rem;" id="eod-candidates">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Activated</div><div class="stat" style="font-size:1.4rem;" id="eod-activated">0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Win Rate</div><div class="stat" style="font-size:1.4rem;" id="eod-winrate">—</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Net P&L</div><div class="stat" style="font-size:1.4rem;" id="eod-pnl">₹0</div>
+      </div>
+      <div style="padding:8px;background:#1f2233;border-radius:6px;text-align:center;">
+        <div class="meta">Avg Duration</div><div class="stat" style="font-size:1.4rem;" id="eod-duration">—</div>
+      </div>
+    </div>
+
+    <h3 style="font-size:0.9rem;color:var(--muted);margin:12px 0 6px;">Trade Details</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Call</th><th>Symbol</th><th>Type</th><th>Signal Entry</th>
+          <th>Activated?</th><th>Actual Entry</th><th>Exit</th>
+          <th>P&L</th><th>Duration</th><th>Reason</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody id="eod-trades-body"></tbody>
+    </table>
+  </div>
+  <div id="eod-empty" class="meta" style="margin-top:8px;">Click "Load Report" to view today's trade journal.</div>
+</div>
+
+<!-- Row 4: Historical Data (Zerodha Kite) -->
+<div class="card" id="hist-section" style="margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <h2>📊 Historical Data (Zerodha)</h2>
+    <div class="flex" style="gap:6px;">
+      <button onclick="toggleHistSection()" id="hist-toggle-btn" style="font-size:0.75rem;padding:4px 10px;">▼ Expand</button>
+    </div>
+  </div>
+  <div id="hist-content" style="display:none;">
+    <!-- Controls row -->
+    <div class="hist-controls">
+      <div class="hist-ctrl-group">
+        <label>Instrument</label>
+        <select id="hist-instrument" onchange="onHistInstrumentChange()">
+          <option value="NIFTY" data-token="256265">NIFTY 50</option>
+          <option value="BANKNIFTY" data-token="260105">BANK NIFTY</option>
+          <option value="FINNIFTY" data-token="257801">FIN NIFTY</option>
+          <option value="custom">🔍 Search NFO Option...</option>
+        </select>
+      </div>
+      <div class="hist-ctrl-group" id="hist-search-group" style="display:none;">
+        <label>Search Symbol</label>
+        <input type="text" id="hist-search-input" placeholder="e.g. NIFTY25MAR" oninput="debounceSearch()" />
+        <select id="hist-search-results" size="5" style="display:none;position:absolute;z-index:10;width:100%;max-height:160px;" onchange="selectSearchResult()">
+        </select>
+      </div>
+      <div class="hist-ctrl-group">
+        <label>Interval</label>
+        <select id="hist-interval">
+          <option value="minute">1 min</option>
+          <option value="3minute">3 min</option>
+          <option value="5minute" selected>5 min</option>
+          <option value="15minute">15 min</option>
+          <option value="30minute">30 min</option>
+          <option value="60minute">1 hour</option>
+          <option value="day">Day</option>
+        </select>
+      </div>
+      <div class="hist-ctrl-group">
+        <label>From</label>
+        <input type="date" id="hist-from" />
+      </div>
+      <div class="hist-ctrl-group">
+        <label>To</label>
+        <input type="date" id="hist-to" />
+      </div>
+      <div class="hist-ctrl-group" style="align-self:flex-end;">
+        <button onclick="loadHistoricalChart()" id="hist-load-btn">📈 Load Chart</button>
+      </div>
+      <div class="hist-ctrl-group" style="align-self:flex-end;">
+        <button onclick="downloadHistCSV()" style="background:#64748b;">⬇ CSV</button>
+      </div>
+    </div>
+    <!-- Quick period buttons -->
+    <div class="hist-btn-group">
+      <button class="hist-period-btn" onclick="setHistPeriod('today')">Today</button>
+      <button class="hist-period-btn active" onclick="setHistPeriod('5d')">5D</button>
+      <button class="hist-period-btn" onclick="setHistPeriod('1m')">1M</button>
+      <button class="hist-period-btn" onclick="setHistPeriod('3m')">3M</button>
+      <button class="hist-period-btn" onclick="setHistPeriod('6m')">6M</button>
+      <button class="hist-period-btn" onclick="setHistPeriod('1y')">1Y</button>
+    </div>
+    <!-- OI toggle for NFO options -->
+    <div id="hist-oi-toggle" style="display:none;margin:8px 0;">
+      <label style="font-size:0.8rem;color:var(--muted);cursor:pointer;">
+        <input type="checkbox" id="hist-oi-check" onchange="loadHistoricalChart()" /> Show OI (Open Interest)
+      </label>
+    </div>
+    <!-- Chart container -->
+    <div id="hist-chart-wrap" style="width:100%;height:420px;margin-top:10px;border-radius:6px;overflow:hidden;background:#1a1d29;">
+      <div id="hist-chart" style="width:100%;height:100%;"></div>
+    </div>
+    <!-- Chart info -->
+    <div class="meta" id="hist-chart-meta" style="margin-top:6px;">Select an instrument and click "Load Chart" to view Zerodha historical data.</div>
+  </div>
+</div>
+
+<!-- Row 5: News Section -->
+<div class="news-section">
+  <div class="grid">
+    <div class="card">
+      <h2>📰 Market Mood</h2>
+      <div class="sentiment-bar">
+        <div class="mood-chip" id="mood-chip">LOADING</div>
+        <span class="meta" id="mood-stats">—</span>
+      </div>
+      <div style="display:flex;gap:16px;margin-top:6px;">
+        <div><span style="color:var(--green)">▲</span> Bullish: <b id="bull-count">0</b></div>
+        <div><span style="color:var(--red)">▼</span> Bearish: <b id="bear-count">0</b></div>
+        <div><span style="color:var(--yellow)">—</span> Neutral: <b id="neut-count">0</b></div>
+      </div>
+      <div class="meta" id="news-updated">Last updated: —</div>
+      <button style="margin-top:8px;font-size:0.75rem;padding:4px 10px;" onclick="refreshNews()">⟳ Refresh News</button>
+    </div>
+    <div class="card" style="grid-column: span 2;">
+      <h2>📰 Today's Market News</h2>
+      <div class="news-tabs">
+        <div class="news-tab active" data-cat="top" onclick="switchTab(this,'top')">Top Stories</div>
+        <div class="news-tab" data-cat="india" onclick="switchTab(this,'india')">India</div>
+        <div class="news-tab" data-cat="global" onclick="switchTab(this,'global')">Global</div>
+        <div class="news-tab" data-cat="nifty" onclick="switchTab(this,'nifty')">NIFTY</div>
+        <div class="news-tab" data-cat="commodity" onclick="switchTab(this,'commodity')">Commodities</div>
+        <div class="news-tab" data-cat="forex" onclick="switchTab(this,'forex')">Forex</div>
+      </div>
+      <div class="news-list" id="news-list"><div class="meta">Loading news...</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const WS_URL = `ws://${location.host}/ws/dashboard`;
+let ws;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    document.getElementById('status-dot').className = 'connected';
+    document.getElementById('ws-status').textContent = 'Live';
+  };
+  ws.onclose = () => {
+    document.getElementById('status-dot').className = 'disconnected';
+    document.getElementById('ws-status').textContent = 'Disconnected';
+    setTimeout(connect, 3000);
+  };
+  ws.onmessage = (e) => {
+    try { updateDashboard(JSON.parse(e.data)); } catch {}
+  };
+}
+
+function updateDashboard(d) {
+  // Engine status
+  const es = d.engine_status || 'IDLE';
+  document.getElementById('engine-status').textContent = es;
+  document.getElementById('engine-status').className = 'stat ' +
+    (es.includes('HALTED') || es.includes('CLOSED') ? 'red' :
+     es.includes('SIGNAL') ? 'green' : 'yellow');
+  document.getElementById('last-update').textContent =
+    'Cycle #' + (d.cycle_count||0) + ' | ' + (d.last_update||'').replace('T',' ').slice(0,19);
+
+  // Show/hide market-closed banner + offline btn
+  const offlineBar = document.getElementById('offline-bar');
+  if (es === 'MARKET_CLOSED' || es === 'IDLE' || es === 'DISCONNECTED') {
+    offlineBar.style.display = 'flex';
+    offlineBar.querySelector('.offline-label').textContent =
+      es === 'DISCONNECTED' ? '⚠ Broker disconnected' : '🌙 Market Closed – showing last available data';
+  } else {
+    offlineBar.style.display = 'none';
+  }
+
+  // Spot + ORB
+  document.getElementById('nifty-spot').textContent = d.nifty_spot ? d.nifty_spot.toFixed(2) : '—';
+  const orb = d.orb || {};
+  document.getElementById('orb-range').textContent = orb.captured
+    ? `ORB: [${orb.low?.toFixed(2)} – ${orb.high?.toFixed(2)}]` : 'ORB: waiting…';
+
+  // P&L
+  const risk = d.risk || {};
+  const pnl = risk.daily_pnl || 0;
+  document.getElementById('daily-pnl').textContent = '₹' + pnl.toFixed(2);
+  document.getElementById('daily-pnl').className = 'stat ' + (pnl >= 0 ? 'green' : 'red');
+  document.getElementById('pnl-detail').textContent =
+    `Realised: ₹${(risk.realised_pnl||0).toFixed(2)} | Unrealised: ₹${(risk.unrealised_pnl||0).toFixed(2)}`;
+  const limit = risk.daily_loss_limit || 1;
+  const pnlPct = Math.min(100, Math.abs(pnl) / limit * 100);
+  const bar = document.getElementById('pnl-bar');
+  bar.style.width = pnlPct + '%';
+  bar.style.background = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+  // Open positions
+  document.getElementById('open-pos').textContent = risk.open_positions || 0;
+  document.getElementById('trades-count').textContent =
+    `Trades today: ${risk.total_trades_today||0} | Halted: ${risk.trading_halted?'YES':'NO'}`;
+
+  // OI Analysis
+  const oi = d.oi_analysis || {};
+  const ceOiEl = document.getElementById('ce-oi-chg');
+  const peOiEl = document.getElementById('pe-oi-chg');
+  const ceChg = oi.ce_oi_change_pct || 0;
+  const peChg = oi.pe_oi_change_pct || 0;
+  ceOiEl.textContent = ceChg !== 0 ? (ceChg > 0 ? '+' : '') + ceChg.toFixed(1) + '%' : '—';
+  ceOiEl.style.color = ceChg > 0 ? 'var(--red)' : ceChg < 0 ? 'var(--green)' : 'var(--muted)';
+  peOiEl.textContent = peChg !== 0 ? (peChg > 0 ? '+' : '') + peChg.toFixed(1) + '%' : '—';
+  peOiEl.style.color = peChg > 0 ? 'var(--red)' : peChg < 0 ? 'var(--green)' : 'var(--muted)';
+  // Interpretation
+  const oiInterpEl = document.getElementById('oi-interpretation');
+  if (ceChg !== 0 || peChg !== 0) {
+    let mood = '';
+    if (ceChg < -2 && peChg > 2) mood = '🟢 Bullish OI (CE unwinding + PE writing)';
+    else if (ceChg > 2 && peChg < -2) mood = '🔴 Bearish OI (CE writing + PE unwinding)';
+    else if (ceChg > 5) mood = '🔴 Heavy CE writing (bearish)';
+    else if (peChg > 5) mood = '🔴 Heavy PE buildup (bearish)';
+    else if (ceChg < -5) mood = '🟢 CE short covering (bullish)';
+    else if (peChg < -5) mood = '🟢 PE unwinding (bullish)';
+    else mood = '🟡 Mixed OI signals';
+    oiInterpEl.textContent = mood;
+  }
+
+  // Safety Filters
+  const sf = d.safety_filters || {};
+  const vixVal = d.india_vix || sf.india_vix || 0;
+  document.getElementById('sf-vix').textContent = vixVal ? vixVal.toFixed(1) : '—';
+  const vixSt = document.getElementById('sf-vix-status');
+  if (vixVal > 20) { vixSt.textContent='HIGH'; vixSt.className='badge badge-red'; }
+  else if (vixVal > 15) { vixSt.textContent='WARN'; vixSt.className='badge badge-yellow'; }
+  else { vixSt.textContent='OK'; vixSt.className='badge badge-green'; }
+  const gapType = sf.gap_type || d.gap_type || 'NONE';
+  const gapPct = sf.gap_pct || d.gap_pct || 0;
+  document.getElementById('sf-gap').textContent = gapType + (gapPct ? ' (' + gapPct.toFixed(2) + '%)' : '');
+  document.getElementById('sf-st15m').textContent = sf.st_dir_15m === 1 ? '▲' : sf.st_dir_15m === -1 ? '▼' : '—';
+  document.getElementById('sf-st1h').textContent = sf.st_dir_1h === 1 ? '▲' : sf.st_dir_1h === -1 ? '▼' : '—';
+  const strats = [];
+  strats.push('ORB');
+  if (sf.vwap_enabled) strats.push('VWAP');
+  if (sf.expiry_sell_enabled) strats.push('ExpSell');
+  if (sf.trend_mode_enabled) strats.push('TREND');
+  document.getElementById('sf-strategies').textContent = strats.join(' | ') || 'ORB';
+  document.getElementById('sf-orders').textContent = risk.total_trades_today || 0;
+  document.getElementById('sf-orders-max').textContent = sf.max_orders || 10;
+
+  // Signal
+  const sig = d.signal;
+  const box = document.getElementById('signal-box');
+  const cList = document.getElementById('conditions-list');
+  cList.innerHTML = '';
+  if (sig) {
+    const cls = sig.type === 'BUY' ? 'badge-green' : 'badge-red';
+    box.innerHTML = `<span class="badge ${cls}">${sig.type}</span>
+      <span style="margin-left:8px">Entry: ${sig.entry?.toFixed(2)} | SL: ${sig.sl?.toFixed(2)} | Tgt: ${sig.target?.toFixed(2)}</span>
+      <div class="meta">Confidence: ${sig.confidence?.toFixed(1)}%</div>`;
+    (sig.conditions || []).forEach(c => {
+      const li = document.createElement('li');
+      li.textContent = '✓ ' + c;
+      cList.appendChild(li);
+    });
+  } else {
+    box.innerHTML = '<span class="badge badge-blue">NO SIGNAL</span>';
+  }
+
+  // Scores table
+  const tc = d.top_candidates || {};
+  const tops = tc.top || [];
+  const tbody = document.getElementById('scores-body');
+  tbody.innerHTML = '';
+  tops.forEach(s => {
+    const tr = document.createElement('tr');
+    const name = s.display_name || s.symbol;
+    const cls = s.type === 'CE' ? 'badge-green' : 'badge-red';
+    const oiChg = s.oi_change_pct || 0;
+    const oiCls = oiChg > 0 ? 'color:var(--green)' : oiChg < 0 ? 'color:var(--red)' : '';
+    const oiInterp = s.oi_interpretation || '—';
+    // Build Kite chart URL
+    const kiteChartUrl = s.instrument_token
+      ? `https://kite.zerodha.com/markets/ext/chart/web/tvc/NFO-OPT/${encodeURIComponent(s.symbol)}/${s.instrument_token}`
+      : null;
+    const nameHtml = kiteChartUrl
+      ? `<a class="kite-chart-link" href="${kiteChartUrl}" target="_blank" title="Open premium chart on Kite">${name}</a>`
+      : `<b>${name}</b>`;
+    tr.innerHTML = `<td>${nameHtml}</td>
+      <td><span class="badge ${cls}">${s.type}</span></td>
+      <td><b>₹${(s.entry||s.ltp)?.toFixed(0)}</b></td>
+      <td>₹${(s.stoploss||0)?.toFixed(0)}</td>
+      <td>₹${(s.target1||0)?.toFixed(0)}</td>
+      <td>₹${(s.target2||0)?.toFixed(0)}</td>
+      <td>₹${(s.target3||0)?.toFixed(0)}+</td>
+      <td><b>${(s.risk_reward_pct||0)?.toFixed(1)}%</b></td>
+      <td><b>${s.score?.toFixed(1)}</b></td>
+      <td style="${oiCls}">${oiChg > 0 ? '+' : ''}${oiChg.toFixed(1)}%</td>
+      <td class="meta">${oiInterp}</td>
+      <td>${s.expiry||''}</td>`;
+    tbody.appendChild(tr);
+  });
+  document.getElementById('score-meta').textContent =
+    `${tc.count||0} candidates (top 10% of ${d.all_candidates_count||'—'}) | Avg score: ${tc.avg_score||0} | Max: ${tc.max_score||0}`;
+
+  // Trades table
+  const trades = d.trades || [];
+  const ttbody = document.getElementById('trades-body');
+  ttbody.innerHTML = '';
+  trades.forEach(t => {
+    const tr = document.createElement('tr');
+    const pnlCls = t.pnl >= 0 ? 'green' : 'red';
+    tr.innerHTML = `<td>${t.trade_id?.slice(-8)}</td><td>${t.symbol}</td><td>${t.type}</td>
+      <td>₹${t.entry?.toFixed(2)}</td><td>${t.exit?'₹'+t.exit.toFixed(2):'—'}</td>
+      <td>${t.qty}</td><td style="color:var(--${pnlCls})">₹${t.pnl?.toFixed(2)}</td>
+      <td>${t.score?.toFixed(1)}</td><td>${t.status}</td>`;
+    ttbody.appendChild(tr);
+  });
+}
+
+function runCycle() { ws && ws.send(JSON.stringify({action: 'run_cycle'})); }
+function squareOff() {
+  if (confirm('Square off ALL open positions?'))
+    fetch('/api/engine/square-off', {method:'POST'}).then(r=>r.json()).then(d=>alert(d.message));
+}
+
+// ── Active Positions with Trailing SL ──
+function loadActivePositions() {
+  fetch('/api/engine/active-positions').then(r=>r.json()).then(data=>{
+    const positions = data.positions || [];
+    const tbody = document.getElementById('auto-pos-body');
+    tbody.innerHTML = '';
+    positions.forEach(p => {
+      const tr = document.createElement('tr');
+      const typeCls = p.option_type === 'CE' ? 'badge-green' : 'badge-red';
+      const phaseCls = p.trailing_phase === 'TIGHT' ? 'badge-green'
+        : p.trailing_phase === 'TRAIL_T2' ? 'badge-green'
+        : p.trailing_phase === 'TRAIL_T1' ? 'badge-blue'
+        : p.trailing_phase === 'BREAKEVEN' ? 'badge-yellow'
+        : 'badge-red';
+      const tslImproved = p.trailing_sl > p.sl;
+      const tslStyle = tslImproved ? 'color:var(--green);font-weight:700' : '';
+      const targets = [];
+      if (p.t1_hit) targets.push('T1✓');
+      if (p.t2_hit) targets.push('T2✓');
+      if (p.t3_hit) targets.push('T3✓');
+      const targetsStr = targets.length ? targets.join(' ') : '—';
+      const lastUpdate = p.last_tsl_update || '—';
+      tr.innerHTML = `
+        <td><b>${p.symbol?.split(':').pop() || p.symbol}</b></td>
+        <td><span class="badge ${typeCls}">${p.option_type}</span></td>
+        <td>₹${(p.entry||0).toFixed(1)}</td>
+        <td>${p.remaining_qty}/${p.qty}</td>
+        <td>₹${(p.sl||0).toFixed(1)}</td>
+        <td style="${tslStyle}">₹${(p.trailing_sl||0).toFixed(1)}</td>
+        <td><span class="badge ${phaseCls}">${p.trailing_phase||'INITIAL'}</span></td>
+        <td>₹${(p.highest_price||0).toFixed(1)}</td>
+        <td>₹${(p.t1||0).toFixed(0)}</td>
+        <td>₹${(p.t2||0).toFixed(0)}</td>
+        <td>₹${(p.t3||0).toFixed(0)}</td>
+        <td>${targetsStr}</td>
+        <td class="meta">${lastUpdate}</td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById('auto-pos-meta').textContent =
+      `${positions.length} active position(s) | Auto-refreshes every cycle`;
+  }).catch(()=>{
+    document.getElementById('auto-pos-meta').textContent = 'Failed to load positions';
+  });
+}
+// Auto-refresh active positions every 30 seconds
+setInterval(loadActivePositions, 30000);
+// Load once on page load
+setTimeout(loadActivePositions, 2000);
+function fetchOfflineData() {
+  document.getElementById('offline-btn').textContent = 'Loading…';
+  fetch('/api/engine/offline-data').then(r=>r.json()).then(d=>{
+    updateDashboard(d);
+    document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data';
+  }).catch(()=>{ document.getElementById('offline-btn').textContent = '🔄 Fetch Offline Data'; });
+}
+
+// ── EOD Trade Journal functions ──
+function fetchEODReport() {
+  document.getElementById('eod-empty').textContent = 'Loading…';
+  fetch('/api/engine/eod-report').then(r=>r.json()).then(data=>{
+    const s = data.summary || {};
+    document.getElementById('eod-signals').textContent = s.total_signals || 0;
+    document.getElementById('eod-candidates').textContent = s.total_candidates || 0;
+    document.getElementById('eod-activated').textContent = s.activated_count || 0;
+    document.getElementById('eod-winrate').textContent = (s.win_rate||0).toFixed(0) + '%';
+    const pnl = s.total_pnl || 0;
+    const pnlEl = document.getElementById('eod-pnl');
+    pnlEl.textContent = '₹' + pnl.toFixed(0);
+    pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    document.getElementById('eod-duration').textContent = s.avg_duration || '—';
+
+    // Populate trade details table
+    const tbody = document.getElementById('eod-trades-body');
+    tbody.innerHTML = '';
+    (data.trades || []).forEach((t, i) => {
+      const tr = document.createElement('tr');
+      const activated = t.activated;
+      const pnlVal = t.pnl || 0;
+      const pnlCls = pnlVal >= 0 ? 'green' : 'red';
+      const activatedBadge = activated
+        ? '<span class="badge badge-green">YES</span>'
+        : '<span class="badge badge-yellow">NO</span>';
+      tr.innerHTML = `<td>${i+1}</td>
+        <td><b>${t.display_name||t.symbol}</b></td>
+        <td><span class="badge ${t.option_type==='CE'?'badge-green':'badge-red'}">${t.option_type}</span></td>
+        <td>₹${(t.suggested_entry||0).toFixed(0)}</td>
+        <td>${activatedBadge}</td>
+        <td>${activated?'₹'+(t.actual_entry||0).toFixed(2):'—'}</td>
+        <td>${activated&&t.actual_exit?'₹'+t.actual_exit.toFixed(2):'—'}</td>
+        <td style="color:var(--${pnlCls});font-weight:700">${activated?'₹'+pnlVal.toFixed(2):'—'}</td>
+        <td>${t.duration||'—'}</td>
+        <td>${t.exit_reason||t.status||'—'}</td>
+        <td>${(t.score||0).toFixed(0)}</td>`;
+      tbody.appendChild(tr);
+    });
+
+    document.getElementById('eod-summary').style.display = 'block';
+    document.getElementById('eod-empty').style.display = 'none';
+  }).catch(e=>{
+    document.getElementById('eod-empty').textContent = 'Failed to load report.';
+  });
+}
+
+function sendEODTelegram() {
+  fetch('/api/engine/send-eod-report', {method:'POST'}).then(r=>r.json()).then(d=>{
+    alert('EOD report sent to Telegram! (' + (d.messages_sent||0) + ' messages)');
+  }).catch(()=>alert('Failed to send EOD report.'));
+}
+
+// ── News functions ──
+let newsData = null;
+let currentTab = 'top';
+
+function fetchNews(refresh=false) {
+  const url = refresh ? '/api/news?refresh=true' : '/api/news';
+  fetch(url).then(r=>r.json()).then(data => {
+    newsData = data;
+    updateMood(data.sentiment_summary || {});
+    renderNews(currentTab);
+    document.getElementById('news-updated').textContent =
+      'Last updated: ' + (data.last_updated||"").replace('T',' ').slice(0,19)
+      + ' | ' + (data.total_articles||0) + ' articles';
+  }).catch(()=>{});
+}
+
+function updateMood(s) {
+  const chip = document.getElementById('mood-chip');
+  chip.textContent = s.overall_mood || 'NEUTRAL';
+  chip.className = 'mood-chip mood-' + (s.overall_mood||'NEUTRAL');
+  document.getElementById('mood-stats').textContent = 'Avg sentiment: ' + (s.avg_sentiment||0).toFixed(4);
+  document.getElementById('bull-count').textContent = s.bullish_count || 0;
+  document.getElementById('bear-count').textContent = s.bearish_count || 0;
+  document.getElementById('neut-count').textContent = s.neutral_count || 0;
+}
+
+function renderNews(tab) {
+  if (!newsData) return;
+  const list = document.getElementById('news-list');
+  let articles = [];
+  const cats = newsData.categories || {};
+  if (tab === 'top') articles = newsData.top_stories || [];
+  else if (tab === 'india') articles = [...(cats.india_market||[]), ...(cats.nifty||[]), ...(cats.sector||[])];
+  else if (tab === 'global') articles = [...(cats.global_market||[]), ...(cats.commodity||[]), ...(cats.forex||[])];
+  else articles = cats[tab] || [];
+  // Sort by relevance
+  articles.sort((a,b) => (b.relevance_score||0) - (a.relevance_score||0));
+  if (!articles.length) {
+    list.innerHTML = '<div class="meta">No articles in this category.</div>';
+    return;
+  }
+  list.innerHTML = articles.slice(0, 30).map(a => {
+    const sentCls = a.sentiment_label==='bullish' ? 'badge-green' : a.sentiment_label==='bearish' ? 'badge-red' : 'badge-yellow';
+    const timeStr = a.published ? new Date(a.published).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}) : '';
+    return `<div class="news-item">
+      <div class="news-title"><a href="${a.url}" target="_blank">${a.title}</a></div>
+      <div class="news-summary">${a.summary||''}</div>
+      <div class="news-meta">
+        <span>${a.source}</span><span>${timeStr}</span>
+        <span class="badge ${sentCls}">${a.sentiment_label} ${a.sentiment>0?'+':''}${a.sentiment?.toFixed(3)||''}</span>
+        <span>Rel: ${a.relevance_score?.toFixed(0)||0}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function switchTab(el, tab) {
+  currentTab = tab;
+  document.querySelectorAll('.news-tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  renderNews(tab);
+}
+
+function refreshNews() { fetchNews(true); }
+
+connect();
+// Fetch news on load + every 10 min
+fetchNews();
+setInterval(fetchNews, 600000);
+// Also poll engine every 30s as fallback
+setInterval(() => {
+  fetch('/api/engine/dashboard').then(r=>r.json()).then(updateDashboard).catch(()=>{});
+}, 30000);
+// Auto-fetch offline data on page load if market is closed
+fetch('/api/engine/dashboard').then(r=>r.json()).then(d => {
+  updateDashboard(d);
+  const st = d.engine_status || 'IDLE';
+  if (st === 'MARKET_CLOSED' || st === 'IDLE' || st === 'DISCONNECTED') {
+    fetchOfflineData();
+  }
+}).catch(()=>{});
+</script>
+<!-- TradingView Lightweight Charts (open source) -->
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+// ============================================================
+// Historical Data Chart (Zerodha Kite)
+// ============================================================
+let histChart = null;
+let histCandleSeries = null;
+let histVolumeSeries = null;
+let histOISeries = null;
+let histExpanded = false;
+let histSearchTimer = null;
+let histCustomToken = null;
+let histIsNFO = false;
+
+// Default dates: 5 days back → today
+(function initHistDates() {
+  const today = new Date();
+  const from = new Date(today);
+  from.setDate(from.getDate() - 5);
+  document.getElementById('hist-to').value = today.toISOString().slice(0, 10);
+  document.getElementById('hist-from').value = from.toISOString().slice(0, 10);
+})();
+
+function toggleHistSection() {
+  histExpanded = !histExpanded;
+  document.getElementById('hist-content').style.display = histExpanded ? 'block' : 'none';
+  document.getElementById('hist-toggle-btn').textContent = histExpanded ? '▲ Collapse' : '▼ Expand';
+  if (histExpanded && !histChart) initHistChart();
+}
+
+function initHistChart() {
+  const container = document.getElementById('hist-chart');
+  if (!container || typeof LightweightCharts === 'undefined') return;
+  histChart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 400,
+    layout: { background: { type: 'solid', color: '#1a1d29' }, textColor: '#e2e8f0' },
+    grid: { vertLines: { color: '#2a2d3a' }, horzLines: { color: '#2a2d3a' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#3a3d4a' },
+    timeScale: { borderColor: '#3a3d4a', timeVisible: true, secondsVisible: false },
+  });
+  histCandleSeries = histChart.addCandlestickSeries({
+    upColor: '#22c55e', downColor: '#ef4444', borderDownColor: '#ef4444',
+    borderUpColor: '#22c55e', wickDownColor: '#ef4444', wickUpColor: '#22c55e',
+  });
+  histVolumeSeries = histChart.addHistogramSeries({
+    color: '#4a9eff44', priceFormat: { type: 'volume' },
+    priceScaleId: '', scaleMargins: { top: 0.85, bottom: 0 },
+  });
+  // Resize observer
+  const ro = new ResizeObserver(() => {
+    if (histChart) histChart.applyOptions({ width: container.clientWidth });
+  });
+  ro.observe(container);
+}
+
+function onHistInstrumentChange() {
+  const sel = document.getElementById('hist-instrument');
+  const isCustom = sel.value === 'custom';
+  document.getElementById('hist-search-group').style.display = isCustom ? 'flex' : 'none';
+  document.getElementById('hist-oi-toggle').style.display = isCustom ? 'block' : 'none';
+  histIsNFO = isCustom;
+  if (!isCustom) {
+    histCustomToken = null;
+    document.getElementById('hist-search-results').style.display = 'none';
+  }
+}
+
+function debounceSearch() {
+  clearTimeout(histSearchTimer);
+  histSearchTimer = setTimeout(searchHistInstruments, 400);
+}
+
+async function searchHistInstruments() {
+  const q = document.getElementById('hist-search-input').value.trim();
+  if (q.length < 2) {
+    document.getElementById('hist-search-results').style.display = 'none';
+    return;
+  }
+  try {
+    const res = await fetch(`/api/market/instruments/search?query=${encodeURIComponent(q)}&exchange=NFO&limit=20`);
+    const data = await res.json();
+    const sel = document.getElementById('hist-search-results');
+    sel.innerHTML = '';
+    if (data.instruments && data.instruments.length > 0) {
+      data.instruments.forEach(i => {
+        const opt = document.createElement('option');
+        opt.value = i.instrument_token;
+        opt.textContent = `${i.tradingsymbol} | ${i.instrument_type} | ${i.strike || ''} | ${i.expiry || ''}`;
+        opt.dataset.symbol = i.tradingsymbol;
+        sel.appendChild(opt);
+      });
+      sel.style.display = 'block';
+    } else {
+      sel.style.display = 'none';
+    }
+  } catch (e) {
+    console.error('Instrument search failed:', e);
+  }
+}
+
+function selectSearchResult() {
+  const sel = document.getElementById('hist-search-results');
+  if (sel.selectedIndex >= 0) {
+    histCustomToken = parseInt(sel.value);
+    const opt = sel.options[sel.selectedIndex];
+    document.getElementById('hist-search-input').value = opt.dataset.symbol || opt.textContent;
+    sel.style.display = 'none';
+    histIsNFO = true;
+    document.getElementById('hist-oi-toggle').style.display = 'block';
+  }
+}
+
+function setHistPeriod(period) {
+  const today = new Date();
+  const from = new Date(today);
+  let interval = document.getElementById('hist-interval').value;
+
+  // Set date range and auto-adjust interval if needed
+  const intervalMaxDays = {
+    'minute': 60, '3minute': 100, '5minute': 100, '10minute': 100,
+    '15minute': 200, '30minute': 200, '60minute': 400, 'hour': 400, 'day': 2000
+  };
+
+  switch (period) {
+    case 'today':
+      from.setDate(from.getDate());
+      from.setHours(0,0,0,0);
+      if (['day','60minute','hour'].includes(interval)) interval = '5minute';
+      break;
+    case '5d':
+      from.setDate(from.getDate() - 5);
+      break;
+    case '1m':
+      from.setMonth(from.getMonth() - 1);
+      if (interval === 'minute') interval = '5minute';
+      break;
+    case '3m':
+      from.setMonth(from.getMonth() - 3);
+      if (['minute','3minute','5minute'].includes(interval)) interval = '15minute';
+      break;
+    case '6m':
+      from.setMonth(from.getMonth() - 6);
+      if (['minute','3minute','5minute','10minute','15minute'].includes(interval)) interval = '60minute';
+      break;
+    case '1y':
+      from.setFullYear(from.getFullYear() - 1);
+      interval = 'day';
+      break;
+  }
+
+  // Clamp to max allowed
+  const maxDays = intervalMaxDays[interval] || 60;
+  const diffDays = Math.ceil((today - from) / (1000*60*60*24));
+  if (diffDays > maxDays) {
+    from.setTime(today.getTime() - maxDays * 24*60*60*1000);
+  }
+
+  document.getElementById('hist-from').value = from.toISOString().slice(0, 10);
+  document.getElementById('hist-to').value = today.toISOString().slice(0, 10);
+  document.getElementById('hist-interval').value = interval;
+
+  // Update active button
+  document.querySelectorAll('.hist-period-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+
+  loadHistoricalChart();
+}
+
+async function loadHistoricalChart() {
+  const instSel = document.getElementById('hist-instrument');
+  const interval = document.getElementById('hist-interval').value;
+  const fromDate = document.getElementById('hist-from').value;
+  const toDate = document.getElementById('hist-to').value;
+  const btn = document.getElementById('hist-load-btn');
+  const meta = document.getElementById('hist-chart-meta');
+  const includeOI = document.getElementById('hist-oi-check')?.checked && histIsNFO;
+
+  if (!fromDate || !toDate) {
+    meta.textContent = '⚠️ Please select both From and To dates.';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Loading...';
+  meta.textContent = 'Fetching data from Zerodha...';
+
+  let url;
+  let label;
+  if (instSel.value === 'custom' && histCustomToken) {
+    url = `/api/market/history/${histCustomToken}?interval=${interval}&from_date=${fromDate}&to_date=${toDate}&oi=${includeOI}`;
+    label = document.getElementById('hist-search-input').value || `Token ${histCustomToken}`;
+  } else if (instSel.value !== 'custom') {
+    url = `/api/market/history/index/${instSel.value}?interval=${interval}&from_date=${fromDate}&to_date=${toDate}`;
+    label = instSel.options[instSel.selectedIndex].textContent;
+  } else {
+    meta.textContent = '⚠️ Please search and select an instrument first.';
+    btn.disabled = false;
+    btn.textContent = '📈 Load Chart';
+    return;
+  }
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const json = await res.json();
+    const data = json.data || [];
+
+    if (data.length === 0) {
+      meta.textContent = '⚠️ No data returned. Market may be closed or invalid date range.';
+      btn.disabled = false;
+      btn.textContent = '📈 Load Chart';
+      return;
+    }
+
+    if (!histChart) initHistChart();
+
+    // Parse data for lightweight-charts
+    const candles = [];
+    const volumes = [];
+    const oiData = [];
+
+    data.forEach(d => {
+      const t = Math.floor(new Date(d.date).getTime() / 1000);
+      candles.push({ time: t, open: d.open, high: d.high, low: d.low, close: d.close });
+      volumes.push({
+        time: t, value: d.volume || 0,
+        color: d.close >= d.open ? '#22c55e44' : '#ef444444',
+      });
+      if (includeOI && d.oi !== undefined) {
+        oiData.push({ time: t, value: d.oi });
+      }
+    });
+
+    histCandleSeries.setData(candles);
+    histVolumeSeries.setData(volumes);
+
+    // OI series
+    if (histOISeries) {
+      histChart.removeSeries(histOISeries);
+      histOISeries = null;
+    }
+    if (includeOI && oiData.length > 0) {
+      histOISeries = histChart.addLineSeries({
+        color: '#eab308', lineWidth: 1, priceScaleId: 'oi',
+        title: 'OI',
+      });
+      histChart.priceScale('oi').applyOptions({
+        scaleMargins: { top: 0.1, bottom: 0.4 },
+      });
+      histOISeries.setData(oiData);
+    }
+
+    histChart.timeScale().fitContent();
+
+    const lastCandle = candles[candles.length - 1];
+    const change = lastCandle.close - candles[0].open;
+    const changePct = ((change / candles[0].open) * 100).toFixed(2);
+    const changeColor = change >= 0 ? 'var(--green)' : 'var(--red)';
+    meta.innerHTML = `<b>${label}</b> | ${interval} | ${data.length} candles | `
+      + `Last: ₹${lastCandle.close.toFixed(2)} | `
+      + `<span style="color:${changeColor}">${change >= 0 ? '+' : ''}${change.toFixed(2)} (${changePct}%)</span> | `
+      + `<span style="color:var(--muted)">Source: Zerodha Kite Historical API</span>`;
+
+  } catch (e) {
+    meta.textContent = `❌ Error: ${e.message}`;
+    console.error('Historical chart error:', e);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '📈 Load Chart';
+}
+
+function downloadHistCSV() {
+  const instSel = document.getElementById('hist-instrument');
+  const interval = document.getElementById('hist-interval').value;
+  const fromDate = document.getElementById('hist-from').value;
+  const toDate = document.getElementById('hist-to').value;
+  const includeOI = document.getElementById('hist-oi-check')?.checked && histIsNFO;
+
+  let token;
+  const indexTokens = { NIFTY: 256265, BANKNIFTY: 260105, FINNIFTY: 257801, MIDCPNIFTY: 288009 };
+
+  if (instSel.value === 'custom' && histCustomToken) {
+    token = histCustomToken;
+  } else if (instSel.value !== 'custom') {
+    token = indexTokens[instSel.value];
+  } else {
+    alert('Please select an instrument first.');
+    return;
+  }
+
+  const url = `/api/market/history/${token}/csv?interval=${interval}&from_date=${fromDate}&to_date=${toDate}&oi=${includeOI}`;
+  window.open(url, '_blank');
+}
+
+// Close search dropdown when clicking outside
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#hist-search-group')) {
+    document.getElementById('hist-search-results').style.display = 'none';
+  }
+});
+</script>
+</body>
+</html>
+

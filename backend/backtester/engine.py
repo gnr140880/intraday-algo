@@ -24,6 +24,11 @@ import numpy as np
 
 from strategies.nifty_options_orb import NiftyOptionsORBStrategy
 from strategies.vwap_mean_reversion import VWAPMeanReversionStrategy
+from strategies.supertrend_strategy import SupertrendStrategy
+from strategies.ema_crossover import EMACrossoverStrategy
+from strategies.rsi_divergence import RSIDivergenceStrategy
+from strategies.vwap_breakout import VWAPBreakoutStrategy
+from strategies.gap_fill import GapFillStrategy
 from strategies.base_strategy import SignalType
 from level_calculator import LevelCalculator
 from slippage_model import SlippageModel
@@ -31,6 +36,17 @@ from config import settings
 from backtester.results import BacktestResults, BacktestTrade
 
 logger = logging.getLogger(__name__)
+
+# Strategy registry for backtesting
+BACKTEST_STRATEGY_REGISTRY = {
+    "ORB": "orb_strategy",
+    "VWAP_MR": "vwap_strategy",
+    "VWAP_BREAKOUT": "vwap_breakout_strategy",
+    "SUPERTREND": "supertrend_strategy",
+    "EMA_CROSSOVER": "ema_crossover_strategy",
+    "RSI_DIVERGENCE": "rsi_divergence_strategy",
+    "GAP_FILL": "gap_fill_strategy",
+}
 
 
 class BacktestEngine:
@@ -60,6 +76,11 @@ class BacktestEngine:
         # Strategy instances
         self.orb_strategy = NiftyOptionsORBStrategy()
         self.vwap_strategy = VWAPMeanReversionStrategy()
+        self.supertrend_strategy = SupertrendStrategy()
+        self.ema_crossover_strategy = EMACrossoverStrategy()
+        self.rsi_divergence_strategy = RSIDivergenceStrategy()
+        self.vwap_breakout_strategy = VWAPBreakoutStrategy()
+        self.gap_fill_strategy = GapFillStrategy()
         self.level_calc = LevelCalculator()
 
         # Slippage
@@ -280,17 +301,41 @@ class BacktestEngine:
             df_slice = df.iloc[:i + 1].copy()
 
             signal = None
-            if self.strategy_name in ("ORB", "ALL"):
-                signal = self.orb_strategy.generate_signal(df_slice, "NIFTY")
+            strategies_to_run = []
+            if self.strategy_name == "ALL":
+                strategies_to_run = list(BACKTEST_STRATEGY_REGISTRY.keys())
+            elif self.strategy_name in BACKTEST_STRATEGY_REGISTRY:
+                strategies_to_run = [self.strategy_name]
+            else:
+                strategies_to_run = [self.strategy_name]
 
-            if signal is None and self.strategy_name in ("VWAP", "ALL"):
-                signal = self.vwap_strategy.generate_signal(
-                    df_slice, "NIFTY",
-                    levels=levels,
-                    orb_high=orb_high, orb_low=orb_low,
-                    india_vix=0,
-                    gap_type=gap_type,
-                )
+            for strat_name in strategies_to_run:
+                if signal is not None:
+                    break
+                try:
+                    if strat_name == "ORB":
+                        signal = self.orb_strategy.generate_signal(df_slice, "NIFTY")
+                    elif strat_name == "VWAP_MR":
+                        signal = self.vwap_strategy.generate_signal(
+                            df_slice, "NIFTY", levels=levels,
+                            orb_high=orb_high, orb_low=orb_low,
+                            india_vix=0, gap_type=gap_type)
+                    elif strat_name == "VWAP_BREAKOUT":
+                        signal = self.vwap_breakout_strategy.generate_signal(
+                            df_slice, "NIFTY", orb_high=orb_high, orb_low=orb_low)
+                    elif strat_name == "SUPERTREND":
+                        signal = self.supertrend_strategy.generate_signal(df_slice, "NIFTY")
+                    elif strat_name == "EMA_CROSSOVER":
+                        signal = self.ema_crossover_strategy.generate_signal(df_slice, "NIFTY")
+                    elif strat_name == "RSI_DIVERGENCE":
+                        signal = self.rsi_divergence_strategy.generate_signal(df_slice, "NIFTY")
+                    elif strat_name == "GAP_FILL":
+                        pdc = levels.pdc if levels else 0
+                        signal = self.gap_fill_strategy.generate_signal(
+                            df_slice, "NIFTY", gap_type=gap_type,
+                            gap_pct=gap_pct, prev_close=pdc)
+                except Exception as e:
+                    logger.debug(f"Backtest {strat_name} signal error: {e}")
 
             if signal and signal.confidence >= settings.min_confidence_threshold:
                 # Apply slippage to entry

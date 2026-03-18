@@ -23,17 +23,17 @@ Setup:
 """
 import logging
 import httpx
-import requests
 from dotenv import load_dotenv
 import os
 from typing import List, Dict
+from config import settings
 
 from datetime import datetime
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -48,8 +48,9 @@ class TelegramAlerter:
     """
 
     def __init__(self):
-        self.token: str = os.getenv("BOT_TOKEN")
-        self.chat_id: str = os.getenv("CHAT_ID")
+        # Prefer central settings (backend/config.py), fallback to env vars
+        self.token: str = settings.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id: str = settings.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self.enabled: bool = bool(self.token and self.chat_id)
         self._last_sent: Dict[str, float] = {}  # rate limit tracker
         self._min_interval = 5  # min seconds between same alert type
@@ -61,8 +62,8 @@ class TelegramAlerter:
 
     def reload_config(self):
         """Reload token/chat_id from environment variables (if updated at runtime)."""
-        self.token = os.getenv("BOT_TOKEN")
-        self.chat_id = os.getenv("CHAT_ID")
+        self.token = settings.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = settings.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self.enabled = bool(self.token and self.chat_id)
 
     def _rate_ok(self, key: str) -> bool:
@@ -118,20 +119,44 @@ class TelegramAlerter:
     # ------------------------------------------------------------------
     def alert_signal(self, signal_type: str, entry: float, sl: float,
                      target: float, confidence: float, conditions: List[str],
-                     reasoning: str):
+                     reasoning: str, option_strike=None, option_type=None,
+                     option_expiry=None, option_symbol=None, strategy_name: str = ""):
         if not self._rate_ok(f"signal_{signal_type}"):
             return
-        emoji = "🟢" if signal_type == "BUY" else "🔴"
+
+        # Translate spot direction into OPTIONS ACTION so the user
+        # never sees a confusing "SELL" when we actually BUY a PUT.
+        #   Spot BUY  → BUY CALL (CE)  → Bullish view
+        #   Spot SELL → BUY PUT  (PE)  → Bearish view
+        if signal_type == "BUY":
+            emoji = "📈"
+            action_label = "BUY CALL (CE)"
+            direction_label = "BULLISH"
+        else:
+            emoji = "📉"
+            action_label = "BUY PUT (PE)"
+            direction_label = "BEARISH"
+
         cond_text = "\n".join(f"  ✓ {c}" for c in conditions[:5])
         rr = abs(target - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+        option_info = ""
+        if option_symbol and option_strike and option_type:
+            option_info = (
+                f"\n🎯 <b>Option:</b> <code>{option_symbol}</code>\n"
+                f"   Strike: <b>{option_strike}</b> {option_type}\n"
+                f"   Expiry: <b>{option_expiry}</b>\n"
+            )
+        strat_label = f" [{strategy_name}]" if strategy_name else ""
         text = (
-            f"{emoji} <b>SIGNAL: {signal_type}</b>\n"
+            f"{emoji} <b>{action_label}{strat_label}</b>\n"
+            f"View: {direction_label}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"Entry:  <b>₹{entry:.2f}</b>\n"
-            f"SL:     ₹{sl:.2f}\n"
-            f"Target: ₹{target:.2f}\n"
+            f"NIFTY Spot: <b>₹{entry:.2f}</b>\n"
+            f"Spot SL:    ₹{sl:.2f}\n"
+            f"Spot Target:₹{target:.2f}\n"
             f"R:R:    {rr:.1f}\n"
-            f"Confidence: {confidence:.0f}%\n\n"
+            f"Confidence: {confidence:.0f}%\n"
+            f"{option_info}"
             f"<b>Conditions:</b>\n{cond_text}\n\n"
             f"💡 {reasoning}\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
@@ -147,8 +172,10 @@ class TelegramAlerter:
         if not self._rate_ok(f"entry_{trade_id}"):
             return
         emoji = "📈" if option_type == "CE" else "📉"
+        mode = settings.trading_mode.upper()
+        mode_tag = f"[{mode}] " if mode == "PAPER" else "🔴 [LIVE] "
         text = (
-            f"{emoji} <b>TRADE ENTRY</b>\n"
+            f"{emoji} <b>{mode_tag}ORDER PLACED ✅</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Type:   {option_type}\n"
@@ -293,7 +320,7 @@ class TelegramAlerter:
 
         for c in candidates[:3]:
             name = c.get('display_name', c.get('symbol', '?'))
-            opt = c.get('type', '')
+            opt = c.get('type', '')  # CE or PE
             expiry = c.get('expiry', '')
             entry = c.get('entry', c.get('ltp', 0))
             sl = c.get('stoploss', 0)
@@ -305,16 +332,26 @@ class TelegramAlerter:
             delta = c.get('delta', 0)
             iv = c.get('iv', 0)
 
+            # Clear option action label
+            if opt == "CE":
+                action = "📈 BUY CALL"
+            elif opt == "PE":
+                action = "📉 BUY PUT"
+            else:
+                action = f"BUY {opt}"
+
             text = (
-                f"‼️ <b>{name}</b> ‼️\n"
+                f"📋 <b>WATCHLIST: {name}</b>\n"
+                f"<i>(Candidate – auto-trade will execute if enabled)</i>\n"
+                f"Action: <b>{action}</b>\n"
                 f"\n"
-                f"✅ BUY ABOVE - <b>{entry:.0f}</b>\n"
+                f"✅ BUY {opt} ABOVE - <b>₹{entry:.0f}</b>\n"
                 f"\n"
-                f"💰 TGT 1 - <b>{t1:.0f}</b>\n"
-                f"💰 TGT 2 - <b>{t2:.0f}</b>\n"
-                f"💰 TGT 3 - <b>{t3:.0f}++</b>\n"
+                f"💰 TGT 1 - ₹<b>{t1:.0f}</b>\n"
+                f"💰 TGT 2 - ₹<b>{t2:.0f}</b>\n"
+                f"💰 TGT 3 - ₹<b>{t3:.0f}++</b>\n"
                 f"\n"
-                f"❗ SL - <b>{sl:.0f}</b>\n"
+                f"❗ SL - ₹<b>{sl:.0f}</b>\n"
                 f"\n"
                 f"📊 Risk/Reward: <b>{rr_pct:.1f}%</b>\n"
                 f"Δ {delta:.2f} | IV {iv:.1f}% | Score {score:.0f}/100\n"
@@ -359,6 +396,10 @@ class TelegramAlerter:
     def send_custom(self, message: str):
         """Send a custom text message."""
         self._send(message)
+
+    # Backward-compatible alias used in some modules
+    def send_message(self, message: str):
+        self.send_custom(message)
 
     # ------------------------------------------------------------------
     # Test connectivity
